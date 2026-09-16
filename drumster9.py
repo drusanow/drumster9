@@ -1449,6 +1449,80 @@ def random_steps(name):
     return sorted(set(s % NUM_STEPS for s in steps))
 
 
+# --- deferred grid repaint ---------------------------------------------
+#
+# Switching pattern (a bank slot at the bar boundary, a preset, a paste)
+# rewrites up to 7 lanes x 32 steps. The model + AMY event updates are
+# what the MUSIC needs and they are cheap; the expensive part is the LVGL
+# work - one bg-colour write per changed cell, up to 224 of them. A bank
+# switch lands inside _led_tick, so doing that painting there stalls the
+# sequencer callback and delays the pre-hit choke: an audible hitch, plus
+# the visible pause while the grid redraws.
+#
+# So bulk pattern loads run inside a _DeferCells() block: step edits still
+# update step_set and the AMY events immediately (the swap is sample
+# accurate), but the cells are NOT painted. The repaint is scheduled once,
+# on the defer clock, off the sequencer tick. The grid lags the audio by a
+# few ms, which is exactly the trade we want - seamless audio first, the
+# hits draw in right behind it.
+
+CELL_REPAINT_MS = 1        # repaint on the next defer tick, off the callback
+
+_cell_defer_depth = 0
+_cells_dirty = False
+
+
+def _cells_deferred():
+    return _cell_defer_depth > 0
+
+
+class _DeferCells:
+    """Context manager: inside it, step edits skip painting their cell and
+    a single repaint is scheduled on the way out. Nests."""
+    def __enter__(self):
+        global _cell_defer_depth
+        _cell_defer_depth += 1
+        return self
+
+    def __exit__(self, *exc):
+        global _cell_defer_depth
+        _cell_defer_depth -= 1
+        if _cell_defer_depth <= 0:
+            _cell_defer_depth = 0
+            _schedule_cell_repaint()
+        return False
+
+
+def _schedule_cell_repaint():
+    global _cells_dirty
+    if _cells_dirty:
+        return
+    _cells_dirty = True
+    # deliberately deferred: this is the LVGL work we are moving off the
+    # sequencer tick. defer_safe falls back to running inline only if every
+    # defer slot is taken, which is still correct, just not deferred.
+    defer_safe(_repaint_cells, None, CELL_REPAINT_MS)
+
+
+def _repaint_cells(arg=None):
+    """Bring the grid back in line with the model. Only cells whose state
+    actually changed are written, so this is as small as the edit was."""
+    global _cells_dirty
+    _cells_dirty = False
+    if app is None:
+        return
+    for r in app.rows:
+        try:
+            r.sync_cells()
+        except Exception:
+            pass
+    if app.bank_row is not None:
+        try:
+            app.bank_row.refresh()
+        except Exception:
+            pass
+
+
 # --- one step cell -----------------------------------------------------
 
 class Cell:
@@ -1487,6 +1561,8 @@ class Cell:
             pass      # widget deleted (stale instance) - skip, don't crash
 
     def set_on(self, v):
+        if v == self.on:
+            return          # already this colour - don't pay for a redraw
         self.on = v
         self.redraw()
 
@@ -1725,16 +1801,33 @@ class Lane(UIElement):
 
     # -- steps (self.steps / self.step_set are a source of truth) --
 
+    def sync_cells(self):
+        """Repaint this lane's cells from the model, touching only the ones
+        whose state actually differs. Used by the deferred grid repaint
+        after a bulk pattern load (see _DeferCells)."""
+        ss = self.step_set
+        cells = self.cells
+        for s in range(NUM_STEPS):
+            want = s in ss
+            c = cells[s]
+            if c.on != want:
+                c.set_on(want)
+
     def set_step(self, step, on):
+        # The model + AMY event updates always happen now; painting the
+        # cell is skipped while a bulk load is in progress and done once
+        # afterwards, off the sequencer tick (see _DeferCells).
         if on and step not in self.step_set:
             self.step_set.add(step)
             self.steps = sorted(self.step_set)
-            self.cells[step].set_on(True)
+            if not _cells_deferred():
+                self.cells[step].set_on(True)
             self._add_event(step)
         elif (not on) and step in self.step_set:
             self.step_set.discard(step)
             self.steps = sorted(self.step_set)
-            self.cells[step].set_on(False)
+            if not _cells_deferred():
+                self.cells[step].set_on(False)
             self._remove_event(step)
 
     def toggle_step(self, step):
@@ -2705,10 +2798,12 @@ def apply_preset(idx):
     name = PRESETS[idx][0]
     steps_map = PRESETS[idx][1]
     # one outer batch around all seven lanes -> a preset load is a single
-    # sequence rebuild, not one per lane
-    with _seq_batch():
-        for r in app.rows:
-            r.set_steps(steps_map.get(r.name, []))
+    # sequence rebuild, not one per lane; _DeferCells keeps the grid
+    # repaint off the critical path so the notes swap first
+    with _DeferCells():
+        with _seq_batch():
+            for r in app.rows:
+                r.set_steps(steps_map.get(r.name, []))
     app.header.set_pattern(name)
     _auto_save_slot()
 
@@ -2722,9 +2817,10 @@ def pattern_next(e=None):
 
 
 def clear_all(e=None):
-    with _seq_batch():           # single rebuild for the whole grid
-        for r in app.rows:
-            r.set_steps([])
+    with _DeferCells():
+        with _seq_batch():       # single rebuild for the whole grid
+            for r in app.rows:
+                r.set_steps([])
     _auto_save_slot()
     app.header.set_pattern("(empty)")
 
@@ -2839,12 +2935,15 @@ def apply_pattern_snapshot(pat):
     steps = pat.get("steps", {})
     if not isinstance(steps, dict):
         steps = {}
-    with _seq_batch():           # one rebuild for the whole loaded grid
-        for r in app.rows:
-            s = steps.get(r.name, [])
-            if not isinstance(s, list):
-                s = []
-            r.set_steps(s)
+    # one rebuild for the whole loaded grid, and the cell repaint deferred
+    # off the sequencer tick (this runs at the bar boundary on a bank swap)
+    with _DeferCells():
+        with _seq_batch():
+            for r in app.rows:
+                s = steps.get(r.name, [])
+                if not isinstance(s, list):
+                    s = []
+                r.set_steps(s)
 
 
 def snapshot_project():
@@ -3331,24 +3430,28 @@ def project_load(e=None):
 def _apply_bank(i):
     """Switch to bank slot i. Snapshots the current slot first so any
     edits made since the last switch aren't lost, then loads the new
-    slot and snapshots that too so it shows as populated immediately."""
-    # commit any edits to the slot we're leaving
-    if app.bank_patterns[app.bank_active] is not None or any(r.steps for r in app.rows):
-        app.bank_patterns[app.bank_active] = snapshot_pattern()
-    slot = app.bank_patterns[i]
-    if slot is None:
-        for r in app.rows:
-            r.set_steps([])
-    else:
-        apply_pattern_snapshot(slot)
-    app.bank_active = i
-    app.bank_pending = None
-    # snapshot the newly-loaded slot so it's marked populated in the bank
-    app.bank_patterns[i] = snapshot_pattern()
-    if app.header is not None:
-        app.header.set_pattern("Bank " + BANK_LETTERS[i])
-    if app.bank_row is not None:
-        app.bank_row.refresh()
+    slot and snapshots that too so it shows as populated immediately.
+
+    Runs at the bar boundary from inside _led_tick, so the whole thing is
+    wrapped in _DeferCells: the notes and their AMY events swap right now,
+    and the grid repaints a moment later off the tick."""
+    with _DeferCells():
+        # commit any edits to the slot we're leaving
+        if app.bank_patterns[app.bank_active] is not None or any(r.steps for r in app.rows):
+            app.bank_patterns[app.bank_active] = snapshot_pattern()
+        slot = app.bank_patterns[i]
+        if slot is None:
+            for r in app.rows:
+                r.set_steps([])
+        else:
+            apply_pattern_snapshot(slot)
+        app.bank_active = i
+        app.bank_pending = None
+        # snapshot the newly-loaded slot so it's marked populated in the bank
+        app.bank_patterns[i] = snapshot_pattern()
+        if app.header is not None:
+            app.header.set_pattern("Bank " + BANK_LETTERS[i])
+    # the bank strip is repainted by the deferred grid repaint
 
 
 def bank_select(i):
