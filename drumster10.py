@@ -1750,16 +1750,22 @@ class KitPopup:
     def __init__(self, parent):
         self.lane_i = None
         self.panel = lv.obj(parent)
-        self.panel.set_size(760, 130)
+        # Widened from 760 so the last kit button (Percussion) isn't clipped
+        # at the right edge. Eight buttons - Global + 7 kits - at pitch 92
+        # end at 16 + 92 + 7*92 = 752; an 820-wide, un-padded panel leaves
+        # a comfortable margin past that. lv_depad() removes the default
+        # inner padding that was shifting the whole row right.
+        self.panel.set_size(820, 130)
         self.panel.set_style_bg_color(lv_color(C_PANEL), 0)
         self.panel.set_style_radius(8, 0)
         self.panel.align_to(parent, lv.ALIGN.CENTER, 0, 0)
         self.panel.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.panel)
 
         self.title = lv.label(self.panel)
         self.title.set_text("Kit")
         self.title.align_to(self.panel, lv.ALIGN.LEFT_MID, 16, -44)
-        Button(self.panel, "Close", 650, 90, 36, self.close, C_BTN, -44)
+        Button(self.panel, "Close", 714, 90, 36, self.close, C_BTN, -44)
 
         self.buttons = [Button(self.panel, "Global", 16, 92, 46,
                                 self.make_cb(None), C_KIT_BTN, 20)]
@@ -1847,11 +1853,39 @@ class FXPage:
     Y_STEP = 45
 
     def __init__(self, parent):
-        self.panel = lv.obj(parent)
+        # The FX page lives on its OWN LVGL screen, not as a panel overlaid
+        # on the sequencer's group. Switching to it is a single
+        # lv.screen_load() - the same mechanism Tulip's UIScreen.present()
+        # uses - so the sequencer's ~250 grid objects are simply not in the
+        # render tree while FX is up, and coming back is one screen load
+        # rather than un-hiding every widget one at a time (which is what
+        # made the playhead hitch on the way back). `parent` is no longer
+        # used for the panel; kept for signature compatibility.
+        #
+        # This mirrors UIScreen exactly: a bare lv.obj() screen (left at its
+        # default display size), with a screen_size()-sized group pinned at
+        # the top-left that everything else is centred within - so CENTER is
+        # the middle of the visible UI area, not of a possibly double-width
+        # raw screen.
+        self.screen = lv.obj()          # a top-level screen (no parent)
+        self.fxgroup = lv.obj(self.screen)
+        try:
+            gw, gh = tulip.screen_size()
+        except Exception:
+            gw, gh = 1024, 600
+        self.fxgroup.set_width(gw)
+        self.fxgroup.set_height(gh)
+        self.fxgroup.set_style_radius(0, 0)
+        self.fxgroup.set_style_border_width(0, 0)
+        self.fxgroup.set_style_bg_color(lv_color(0), 0)   # match app bg
+        self.fxgroup.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.fxgroup)
+
+        self.panel = lv.obj(self.fxgroup)
         self.panel.set_size(1000, 470)
         self.panel.set_style_bg_color(lv_color(C_PANEL), 0)
         self.panel.set_style_radius(8, 0)
-        self.panel.align_to(parent, lv.ALIGN.CENTER, 0, 0)
+        self.panel.align_to(self.fxgroup, lv.ALIGN.CENTER, 0, 0)
         self.panel.remove_flag(lv.obj.FLAG.SCROLLABLE)
 
         title = lv.label(self.panel)
@@ -1979,43 +2013,28 @@ class FXPage:
             pass
 
     def show(self):
-        # switch to the FX page: hide the sequencer view and pause the
-        # visual playhead so nothing is drawing the grid behind us. Audio
-        # keeps running - only the visuals pause.
+        # switch to the FX page: load its own screen. The sequencer screen
+        # is left untouched (not rendered), and the visual playhead is
+        # paused - audio keeps running, only the visuals pause.
         app.ui_paused = True
-        set_sequencer_view(False)
         self.refresh()
-        self.panel.remove_flag(lv.obj.FLAG.HIDDEN)
-        self.panel.move_foreground()
+        try:
+            lv.screen_load(self.screen)
+        except Exception as ex:
+            print("fx show failed:", ex)
 
     def close(self, e=None):
         self.hide()
 
     def hide(self):
-        self.panel.add_flag(lv.obj.FLAG.HIDDEN)
-        # back to the sequencer page: clear the LED row, show the grid
-        # again, and let it resume lighting from the current step.
-        set_sequencer_view(True)
+        # back to the sequencer page: load the app's own screen in one
+        # swap, then let the playhead resume lighting from the current step
+        try:
+            lv.screen_load(app.screen)
+        except Exception as ex:
+            print("fx hide failed:", ex)
         clear_leds()
         app.ui_paused = False
-
-
-def set_sequencer_view(visible):
-    """Show or hide the entire drum-sequencer view as one page. Used so
-    the FX page is a real separate page rather than an overlay composited
-    on top of the grid - only one of the two is ever on screen."""
-    widgets = [app.header, app.header2, app.top_spacer, app.led_row,
-               app.led_spacer, app.mid_spacer, app.bank_row] + list(app.rows)
-    for w in widgets:
-        if w is None:
-            continue
-        try:
-            if visible:
-                w.group.remove_flag(lv.obj.FLAG.HIDDEN)
-            else:
-                w.group.add_flag(lv.obj.FLAG.HIDDEN)
-        except Exception:
-            pass
 
 
 def open_fx(e=None):
@@ -3604,6 +3623,23 @@ def quit(screen):
         pass
     try:
         screen.led_seq = None
+    except Exception:
+        pass
+    # the FX page owns its own top-level LVGL screen; delete it so a
+    # re-run doesn't leak one each time. Load the app's screen first in
+    # case FX was the active one, so LVGL is never left on a deleted screen.
+    try:
+        fx = getattr(screen, "fx_page", None)
+        if fx is not None and getattr(fx, "screen", None) is not None:
+            try:
+                lv.screen_load(screen.screen)
+            except Exception:
+                pass
+            try:
+                fx.screen.delete()
+            except Exception:
+                pass
+            fx.screen = None
     except Exception:
         pass
 
