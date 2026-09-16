@@ -412,11 +412,11 @@ BUS_FX_DEFAULTS = {
 # quiet at the individual per-drum velocities this app uses (0.4-0.9,
 # tuned to avoid seven-voice-kit overload on the old GM synth engine,
 # which no longer applies now that each drum is its own PCM sample).
-# Raised to 2.0 as a reasonable first boost. I can't verify actual
-# output level or clipping without hardware - if it's still too quiet,
-# raise further; if busy patterns start sounding harsh/distorted,
-# that's clipping and this is the number to bring back down.
-BUS_VOLUME = 3.0         # per-bus mixdown level into the final output
+# Set to 15 for a loud master by request. I can't verify actual output
+# level or clipping without hardware - if busy patterns start sounding
+# harsh/distorted, that's clipping and this is the number to bring back
+# down.
+BUS_VOLUME = 15.0        # per-bus mixdown level into the final output
 
 
 # --- layout (1024 x 600) ----------------------------------------------

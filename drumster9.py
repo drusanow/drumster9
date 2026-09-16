@@ -1,15 +1,55 @@
 # =====================================================================
 
-#drumster8.py - touchscreen drum machine for Tulip CC
+#drumster9.py - touchscreen drum machine for Tulip CC
 # =====================================================================
-# Install: copy this "drumster8" folder to /user, then:  run('drumster8.py')
+# Install: copy this "drumster9" folder to /user, then:  run('drumster9.py')
 #
-#drumster8 is a 32 step Drum Machine for the Tulip Creative Computer. It uses the drum kits and 
+#drumster9 is a 32 step Drum Machine for the Tulip Creative Computer. It uses the drum kits and
 #samples that are in the Tulip CC and AMYboard. It has 4 assignable FX Buses with Reverb and Delay
-#as well as a filter and drive. 
+#as well as a filter and drive.
 #
 # =====================================================================
 #created by David Rusanow 10/08/26
+# =====================================================================
+#
+# PLAYBACK RELIABILITY + FEATURE CHANGES (this build)
+# ---------------------------------------------------------------------
+# The drum hits are already sequenced by AMY's own C sequencer, on a task
+# separate from MicroPython (see the sequencer note further down), so the
+# hits themselves are sample-accurate. What made the pattern stutter when
+# you touched a control mid-play was NOT the audio engine - it was the
+# amount of Python + amy.send() work a single edit kicked off on the
+# MicroPython task, which then delayed the pre-hit choke (_led_tick) past
+# the step it had to fire on, re-tripping the very PCM retrigger bug the
+# choke exists to hide. The changes below cut that work down:
+#
+#   1. VOLUME no longer rewrites sequence events. Tulip's current
+#      sequencer.py keeps ONE AMY tag per Sequence, and AMY can only
+#      clear a whole tag - so editing one step re-sends EVERY event in
+#      the sequence (Sequence.rebuild()). The old set_vol() called
+#      refresh_events(), i.e. one full rebuild per active step, per
+#      slider tick - hundreds to thousands of amy.send() while dragging.
+#      Lane volume now drives the oscillator's own `amp` gain directly:
+#      exactly one amy.send() per change, no rebuild. (AMY docs: amp's
+#      const coefficient is the oscillator's overall gain, 0 = silent.)
+#
+#   2. Every remaining multi-event operation (mute / solo / transport /
+#      step edits / preset + bank loads / kit change) is wrapped in the
+#      sequencer's own `with seq.batch():`, which collapses N rebuilds
+#      into one. Same result, N-times fewer messages.
+#
+#   3. FX knob sends are COALESCED. A burst of encoder ticks now schedules
+#      a single deferred flush (latest value wins) instead of hammering
+#      amy.send() - and a lane-filter/drive change touches only the lanes
+#      on that bus, once, at the end of the burst.
+#
+#   4. _led_tick() (the choke + CV + LED clock) skips the choke scan while
+#      stopped, so it stays as short as possible on the hot path.
+#
+# Nothing here adds threads or moves amy.send() off the MicroPython task:
+# the firmware already runs AMY rendering and the AMY sequencer on their
+# own high-priority FreeRTOS tasks, so the fix is to stop starving the
+# MicroPython task, not to add concurrency of our own.
 # =====================================================================
 
 from tulip import UIScreen, UIElement, pal_to_lv, lv_depad, lv
@@ -180,6 +220,120 @@ SAMPLE_KITS = [
 ]
 KITS = [(i, name) for i, (name, _roles) in enumerate(SAMPLE_KITS)]
 
+# --- PCM sample banks (for the KITS page) ------------------------------
+#
+# Every PCM sample in the Gamma9001 set, grouped by bank, with its real
+# name from AMY's own manifest. Each tuple is (bank_key, label, first
+# preset, (name, name, ...)); the samples in a bank are contiguous, so a
+# sample's preset is `first + index_in_names`. On Tulip, TR-808 is baked
+# at presets 0..18 and the rest of the bank is memory-mapped starting at
+# preset 256 (GAMMA9001_BASE), which is why the non-808 banks start there.
+# This is a static table (the device has no network) generated from
+# github.com/shorepine/amy/blob/main/sounds/gamma9001/manifest.json.
+PCM_BANKS = [
+    ("tr808", "TR-808", 0, (
+        "TR-808 Bass Drum 1", "TR-808 Bass Drum 2", "TR-808 Bass Drum 3",
+        "TR-808 Clap", "TR-808 Clave", "TR-808 Conga Hi", "TR-808 Conga Lo",
+        "TR-808 Conga Mid", "TR-808 Cowbell", "TR-808 HiHat Closed",
+        "TR-808 HiHat Open", "TR-808 Shaker", "TR-808 Snare 1",
+        "TR-808 Snare 2", "TR-808 Snare 3", "TR-808 Rimshot",
+        "TR-808 Tom Lo", "TR-808 Tom Hi", "TR-808 Cymbal",
+    )),
+    ("tr909", "TR-909", 256, (
+        "909BD", "909BD-LO", "909CLAP", "909CRASH", "909HH", "909HH-LONG",
+        "909HH-SHORT", "909OH", "909OH-LONG", "909OH-SHORT", "909RIDE",
+        "909RIM", "909SD", "909SD-SHORT", "909TOM-HI", "909TOM-LO",
+        "909TOM-MID",
+    )),
+    ("linn9000", "Linn 9000", 273, (
+        "BassDrum 1", "Bongo 3", "CowBell 1", "Cymbal 2", "HiHat Closed 3",
+        "HiHat Open 2", "RimShoot 1", "SnareDrum 1", "Taburine 1",
+        "TomTom 2",
+    )),
+    ("mr12", "MR-12", 283, (
+        "MR-12#HHC", "MR-12#HHO", "MR-12#KICK", "MR-12#SNR",
+    )),
+    ("synthetics", "Tokyo Syn", 287, (
+        "Metallic 09", "Metallic 16", "Static 07", "Wooden 01", "Wooden 02",
+        "Wooden 03", "BD 03", "BD 04", "BD 07", "Tokyo Burst bd",
+        "Tokyo Deep bd", "Tokyo Jet bd", "Tokyo Space", "Hizz 06", "Pew 03",
+        "Boink 02", "Boink 04", "Blop 01", "Blop 02", "Click 05", "Click 06",
+        "Click 07", "Click 08", "Click 09",
+    )),
+    ("power", "80s Power", 311, (
+        "Real Kick", "Metal Kick", "Side Stick", "Power Snare", "Hand Claps",
+        "Gated Snare", "Process Tom 1", "Tight HiHat", "Process Tom 2",
+        "Pedal HiHat", "Process Tom 3", "Open HiHat", "Process Tom 4",
+        "Process Tom 5", "Crash Cymbal", "Process Tom 6", "Ride Edge",
+        "Ride Cup", "Splash Cymbal", "Cowbell",
+    )),
+    ("percussion", "Percussion", 331, (
+        "African Conga 001", "African Conga 002", "African Conga 003",
+        "African Conga 004", "Bongo 001", "Bongo 002", "Bongo 003",
+        "Bongo 004", "Bongo 005", "Bongo 006", "Bongo 007", "Conga 001",
+        "Conga 002", "Conga 003", "Conga 004", "Conga 005", "Conga 006",
+        "Digeridoo", "Kanu 001", "Noice Kick", "Old Snare", "Simple Shaker",
+        "Simple Shaker 002", "Sitar", "Strings Tutti 001",
+        "Strings Tutti 002", "Strings sweep", "Tabla 001", "Tabla 002",
+        "Tabla 003", "Tamb 001", "Tamb 003", "Tamb 004", "Tamp 002",
+        "Timbales 001", "Timbales 002", "Timbales 003", "Timbales 004",
+        "Timpani 001", "Timpani 002", "Triangle 001", "Triangle 002",
+        "Untitled", "Wistle 001",
+    )),
+    ("acoustic", "Acoustic", 375, (
+        "Tambourine Short", "Shaker Short", "Shaker Tiny",
+    )),
+    ("extras", "Extras", 378, (
+        "JCave", "Laser", "Mach3", "Silver", "Vibrablib", "HeHa", "HiHi",
+        "Dim Future", "Smiling", "Ana Strings", "BassRec", "Xox", "Beach",
+        "Narrow",
+    )),
+]
+
+# preset number -> sample name, built once from PCM_BANKS
+SAMPLE_NAMES = {}
+for _bk, _lbl, _start, _names in PCM_BANKS:
+    for _i, _nm in enumerate(_names):
+        SAMPLE_NAMES[_start + _i] = _nm
+
+# bank_key -> (label, first_preset, names)
+_BANK_BY_KEY = {bk: (lbl, start, names)
+                for (bk, lbl, start, names) in PCM_BANKS}
+
+# each kit's primary bank, in SAMPLE_KITS order (they line up with the
+# first seven PCM_BANKS entries: 808, 909, Linn, MR-12, Tokyo, Power, Perc)
+KIT_BANK_KEY = [PCM_BANKS[i][0] for i in range(len(SAMPLE_KITS))]
+
+# the extra "utility" banks every kit can also draw from - the acoustic
+# shakers/tambourine and the extras one-shots the kits already borrow
+UTILITY_BANK_KEYS = ("acoustic", "extras")
+
+
+def sample_name(preset):
+    """Human name for a PCM preset, or 'OFF' for no sample."""
+    if preset == NO_SAMPLE:
+        return "OFF"
+    return SAMPLE_NAMES.get(preset, "preset %d" % preset)
+
+
+def kit_sample_pool(kit_idx):
+    """The samples a kit may use for any of its roles: the kit's own bank
+    plus the acoustic and extras utility banks. Returns a list of
+    (preset, name), in bank order."""
+    keys = [KIT_BANK_KEY[kit_idx % len(KIT_BANK_KEY)]]
+    for k in UTILITY_BANK_KEYS:
+        if k not in keys:
+            keys.append(k)
+    pool = []
+    for k in keys:
+        info = _BANK_BY_KEY.get(k)
+        if not info:
+            continue
+        _lbl, start, names = info
+        for i, nm in enumerate(names):
+            pool.append((start + i, nm))
+    return pool
+
 # name, GM note (reference only - PCM oscillators play at native pitch,
 # so this is no longer used to address AMY, just documents each role),
 # default volume
@@ -258,11 +412,11 @@ BUS_FX_DEFAULTS = {
 # quiet at the individual per-drum velocities this app uses (0.4-0.9,
 # tuned to avoid seven-voice-kit overload on the old GM synth engine,
 # which no longer applies now that each drum is its own PCM sample).
-# Raised to 2.0 as a reasonable first boost. I can't verify actual
-# output level or clipping without hardware - if it's still too quiet,
-# raise further; if busy patterns start sounding harsh/distorted,
-# that's clipping and this is the number to bring back down.
-BUS_VOLUME = 3.0         # per-bus mixdown level into the final output
+# Set to 15 for a loud master by request. I can't verify actual output
+# level or clipping without hardware - if busy patterns start sounding
+# harsh/distorted, that's clipping and this is the number to bring back
+# down.
+BUS_VOLUME = 15.0        # per-bus mixdown level into the final output
 
 
 # --- layout (1024 x 600) ----------------------------------------------
@@ -548,6 +702,19 @@ def clampf(v, lo, hi):
 # Seven fixed oscillators is nothing against AMY's default budget of 180.
 # =====================================================================
 
+def kit_role_preset(kit_idx, role):
+    """Which PCM preset a kit uses for a role: a per-project override from
+    the KITS page if one exists, otherwise the built-in SAMPLE_KITS default."""
+    ov = None
+    if app is not None:
+        ov = getattr(app, "kit_overrides", None)
+    if ov is not None:
+        kov = ov.get(kit_idx)
+        if kov is not None and role in kov:
+            return kov[role]
+    return SAMPLE_KITS[kit_idx][1].get(role, NO_SAMPLE)
+
+
 def configure_lane(lane):
     """(Re)point this lane's fixed oscillator at the sample its current
     kit assigns to its role, and (re)apply its bus routing + filter/
@@ -555,7 +722,7 @@ def configure_lane(lane):
     messages, and ONLY for the lane(s) that actually changed."""
     role = lane.name
     kit_idx = lane.kit_override if lane.kit_override is not None else app.kit_idx
-    preset = SAMPLE_KITS[kit_idx][1].get(role, NO_SAMPLE)
+    preset = kit_role_preset(kit_idx, role)
     if preset != lane._preset:
         lane._preset = preset
         if preset != NO_SAMPLE:
@@ -566,6 +733,75 @@ def configure_lane(lane):
         # if NO_SAMPLE: nothing to configure - out_vel() gates the lane
         # silent below, exactly like a GM kit lacking that drum used to.
     apply_lane_route(lane)
+
+
+def set_kit_sample(kit_idx, role, preset):
+    """Set (or clear) the sample a kit uses for a role, from the KITS page.
+
+    Stored as a per-project override in app.kit_overrides; choosing the
+    built-in default drops the override so the kit reverts cleanly. Any
+    live lane currently playing this kit+role is re-pointed immediately -
+    a couple of osc messages, no sequence rebuild."""
+    default = SAMPLE_KITS[kit_idx][1].get(role, NO_SAMPLE)
+    ov = app.kit_overrides.get(kit_idx)
+    if preset == default:
+        if ov is not None and role in ov:
+            del ov[role]
+            if not ov:
+                app.kit_overrides.pop(kit_idx, None)
+    else:
+        if ov is None:
+            ov = {}
+            app.kit_overrides[kit_idx] = ov
+        ov[role] = preset
+    # re-point every live lane that follows this kit+role
+    for r in app.rows:
+        eff = r.kit_override if r.kit_override is not None else app.kit_idx
+        if eff == kit_idx and r.name == role:
+            configure_lane(r)
+
+
+def audition_preset(preset):
+    """Play a sample once on the scratch oscillator so it can be previewed
+    from the KITS page without disturbing the lanes that are playing."""
+    if preset == NO_SAMPLE:
+        return
+    try:
+        amy.send(osc=TEST_OSC, wave=amy.PCM, preset=preset)
+        amy.send(osc=TEST_OSC, vel=1)
+    except Exception as ex:
+        print("audition failed:", ex)
+
+
+def _gate_open(lane):
+    """Whether this lane should be making sound right now: it has a sample
+    for its role on the current kit, the transport is running, and it is
+    neither muted nor soloed-out."""
+    return (lane.has_sample() and app is not None and app.playing
+            and lane.audible())
+
+
+def lane_amp(lane):
+    """This lane's oscillator gain, and its on/off gate, in one number.
+
+    Everything that decides how loud (or whether) a lane sounds lives on
+    the SAME place - the oscillator's `amp` const coefficient, which AMY
+    treats as the oscillator's overall gain (1.0 = full, 0.0 silences the
+    oscillator entirely, values > 1 add gain):
+
+        - FX "drive" and per-lane volume set the level (drive x vol);
+        - mute / solo / transport-stopped / no-sample close the gate (0).
+
+    Because all of it is one amp message per lane, NONE of these settings
+    has to rebuild the AMY sequence any more - changing volume, muting,
+    soloing, starting/stopping, or switching kits is a handful of
+    osc-level messages that never touch the events AMY is sequencing. The
+    events themselves fire at a fixed full velocity (see out_vel); this
+    number is what actually gates and scales them."""
+    if not _gate_open(lane):
+        return 0.0
+    f = app.bus_fx[lane.bus]
+    return f["drive"] * lane.vol
 
 
 def apply_lane_route(lane):
@@ -588,9 +824,22 @@ def apply_lane_route(lane):
     except Exception:
         pass
     try:
-        _amy_fx(osc=lane._osc, amp=f["drive"])
+        # amp = drive x volume (see lane_amp): the lane's overall gain
+        _amy_fx(osc=lane._osc, amp=lane_amp(lane))
     except Exception:
         pass
+
+
+def refresh_all_amps():
+    """Re-send every lane's oscillator gain. Cheap (one message per lane,
+    no sequence work) - used after loading a project, where each lane's
+    volume may have changed but the amp on the oscillator hasn't caught
+    up yet."""
+    for r in app.rows:
+        try:
+            _amy_fx(osc=r._osc, amp=lane_amp(r))
+        except Exception:
+            pass
 
 
 def configure_all_lanes():
@@ -599,11 +848,31 @@ def configure_all_lanes():
         configure_lane(r)
 
 
+def _fx_num(x):
+    """Format a float for an AMY wire string WITHOUT scientific notation.
+
+    We build reverb/echo/eq as one pre-joined string and pass it straight
+    to amy.send, so amy.py's own float truncation never sees the individual
+    fields. Python's "%s" on a float renders tiny values in exponent form
+    (e.g. dialing a level down by 0.05 lands on 1.39e-17, not 0.0, and
+    prints "1.38...e-17"). AMY's C wire parser reads the mantissa and drops
+    the exponent, so that "0" arrived as ~1.4 - a reverb level way past
+    full, which is the distortion you heard when turning reverb down to 0.
+    Formatting like amy.py's own trunc() (fixed decimals, trailing zeros
+    stripped) keeps every value in plain decimal. Paired with the rounding
+    in fx_set, a knob at 0 now really sends "0"."""
+    try:
+        return ("%.6f" % float(x)).rstrip("0").rstrip(".") or "0"
+    except Exception:
+        return "0"
+
+
 def send_reverb(b):
     f = app.bus_fx[b]
     try:
         _amy_fx(bus=b, reverb="%s,%s,%s" % (
-            f["rev_level"], f["rev_liveness"], f["rev_damping"]))
+            _fx_num(f["rev_level"]), _fx_num(f["rev_liveness"]),
+            _fx_num(f["rev_damping"])))
     except Exception:
         pass
 
@@ -612,8 +881,8 @@ def send_echo(b):
     f = app.bus_fx[b]
     try:
         _amy_fx(bus=b, echo="%s,%s,%s,%s,%s" % (
-            f["echo_level"], int(f["echo_ms"]), 500,
-            f["echo_fb"], f["echo_tone"]))
+            _fx_num(f["echo_level"]), int(f["echo_ms"]), 500,
+            _fx_num(f["echo_fb"]), _fx_num(f["echo_tone"])))
     except Exception:
         pass
 
@@ -621,7 +890,8 @@ def send_echo(b):
 def send_eq(b):
     f = app.bus_fx[b]
     try:
-        _amy_fx(bus=b, eq="%s,%s,%s" % (f["eq_l"], f["eq_m"], f["eq_h"]))
+        _amy_fx(bus=b, eq="%s,%s,%s" % (
+            _fx_num(f["eq_l"]), _fx_num(f["eq_m"]), _fx_num(f["eq_h"])))
     except Exception:
         pass
 
@@ -681,29 +951,77 @@ _FX_GROUP = {
 }
 
 
-def fx_set(key, delta, lo, hi, step, row=None):
-    """Change ONE FX parameter and send ONLY the message it affects.
+# --- coalesced FX sends ------------------------------------------------
+#
+# One knob already maps to one effect group (reverb / echo / eq / slot),
+# so an isolated tweak was never more than a message or a per-bus lane
+# pass. The problem is a *burst*: spinning an encoder fires fx_set() many
+# times in a few tens of ms, and the "slot" group re-routes every lane on
+# the bus each time. That burst competes with _led_tick on the same
+# MicroPython task and can push the choke late enough to drop a hit.
+#
+# So the actual AMY sends are deferred and coalesced per (bus, group):
+# the value in app.bus_fx is updated and the label refreshed immediately
+# (the UI stays responsive), but the amy.send() is batched into a single
+# flush a beat later. Rapid changes to the same knob collapse to one send
+# with the latest value, because the flush reads app.bus_fx at flush time.
 
-    Reverb params -> one reverb message. Echo -> one echo. EQ -> one eq.
-    Filter/drive are per-oscillator, so those touch just the lanes routed
-    to this bus. Nothing else is resent - an unrelated knob no longer
-    triggers a full bus+lane resync (which was flooding AMY and dragging
-    the sequencer)."""
+FX_COALESCE_MS = 40       # collapse a burst of encoder ticks into one send
+_fx_pending = {}          # bus -> set of group names needing a send
+_fx_flush_scheduled = False
+
+
+def _fx_queue(bus, group):
+    """Mark (bus, group) as needing an AMY send and make sure a flush is
+    scheduled. Latest value always wins - the flush re-reads app.bus_fx."""
+    global _fx_flush_scheduled
+    s = _fx_pending.get(bus)
+    if s is None:
+        s = set()
+        _fx_pending[bus] = s
+    s.add(group)
+    if not _fx_flush_scheduled:
+        _fx_flush_scheduled = True
+        # defer_safe falls back to running inline if there is no free defer
+        # slot, which just means the send happens now - still correct.
+        defer_safe(_fx_flush, None, FX_COALESCE_MS)
+
+
+def _fx_flush(arg=None):
+    """Send every queued (bus, group) once, with current values."""
+    global _fx_flush_scheduled
+    _fx_flush_scheduled = False
+    items = list(_fx_pending.items())
+    _fx_pending.clear()
+    for bus, groups in items:
+        try:
+            if "reverb" in groups:
+                send_reverb(bus)
+            if "echo" in groups:
+                send_echo(bus)
+            if "eq" in groups:
+                send_eq(bus)
+            if "slot" in groups:        # per-osc: only lanes on THIS bus
+                for r in app.rows:
+                    if r.bus == bus:
+                        apply_lane_route(r)
+        except Exception as ex:
+            print("fx flush error:", ex)
+
+
+def fx_set(key, delta, lo, hi, step, row=None):
+    """Change ONE FX parameter. The value and its label update now; the
+    AMY message it affects is coalesced onto a deferred flush so a spin of
+    the encoder can't flood the sequencer (see _fx_queue above)."""
     b = app.fx_bus
     f = app.bus_fx[b]
-    f[key] = clampf(f[key] + delta * step, lo, hi)
+    # round to kill floating-point dust: repeatedly adding/subtracting a
+    # step like 0.05 drifts off exact values (e.g. it reaches 1.39e-17
+    # instead of 0.0), which would otherwise reach the wire in exponent
+    # form - see _fx_num for why that distorted the reverb at 0
+    f[key] = round(clampf(f[key] + delta * step, lo, hi), 6)
 
-    grp = _FX_GROUP.get(key, "reverb")
-    if grp == "reverb":
-        send_reverb(b)
-    elif grp == "echo":
-        send_echo(b)
-    elif grp == "eq":
-        send_eq(b)
-    else:                       # per-osc: only lanes on THIS bus
-        for r in app.rows:
-            if r.bus == b:
-                apply_lane_route(r)
+    _fx_queue(b, _FX_GROUP.get(key, "reverb"))
 
     # refresh only the row that changed, not all thirteen labels
     if row is not None:
@@ -743,6 +1061,44 @@ def ticks_per_step():
 # toggle adds/removes one event. A change that alters what a lane plays
 # (its slot synth via kit/bus, or its velocity via vol/mute/solo/play)
 # rebuilds that lane's events. All of this happens off the audio path.
+#
+# Coalescing rebuilds: Tulip's AMYSequence keeps ONE tag per Sequence and
+# AMY can only clear a whole tag, so editing/removing ANY single event
+# re-sends every event still in the sequence (Sequence.rebuild()). A loop
+# that touches N events therefore costs N full rebuilds unless it is
+# wrapped in the sequence's own `with seq.batch():`, which marks the
+# sequence dirty and rebuilds exactly once on the way out. Every
+# multi-event operation below (a lane refresh, a whole-grid load, a
+# transport/mute/solo change) goes through _seq_batch() so it is a single
+# rebuild instead of one-per-step. batch() nests, so it is safe for an
+# outer batch to call inner helpers that also batch.
+
+
+class _NullCtx:
+    """A do-nothing context manager, used when there is no sequence to
+    batch (teardown) or the firmware's AMYSequence predates batch()."""
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+_NULLCTX = _NullCtx()
+
+
+def _seq_batch():
+    """A context manager that coalesces every sequence rebuild inside it
+    into one. Returns the AMYSequence's own batch() when available, else a
+    harmless no-op so callers can always use `with _seq_batch():`."""
+    seq = app.seq
+    if seq is None:
+        return _NULLCTX
+    try:
+        return seq.batch()
+    except AttributeError:
+        return _NULLCTX      # older firmware without batch() - still correct
+
 
 def build_sequence():
     """Create the AMYSequence and add every active event. Called once at
@@ -750,8 +1106,9 @@ def build_sequence():
     drop_sequence()
     _reset_seq_tags()     # a full rebuild is the moment to recycle tags
     app.seq = sequencer.AMYSequence(NUM_STEPS, NUM_STEPS)
-    for r in app.rows:
-        r.rebuild_events()
+    with _seq_batch():
+        for r in app.rows:
+            r.rebuild_events()
 
 
 # AMY's C sequencer (src/sequencer.c) holds only max_sequencer_tags = 256
@@ -819,8 +1176,11 @@ def drop_sequence():
 
 
 def refresh_all_events():
-    for r in app.rows:
-        r.refresh_events()
+    # one batch around all seven lanes: a mute/solo/transport change is a
+    # single sequence rebuild, not one per lane per active step
+    with _seq_batch():
+        for r in app.rows:
+            r.refresh_events()
 
 
 def make_led_clock():
@@ -873,7 +1233,12 @@ def _led_tick(x):
         # in small chunks (see the chunked writer) so nothing here has to
         # stand still. Transport, bank switches and the playhead all keep
         # their timing straight through a save.
-        _choke_next_step(step)
+        # The pre-hit choke only matters while hits are actually sounding.
+        # When stopped, every event fires at MUTE_VEL (silent), so there is
+        # nothing to choke - skip the whole scan to keep this callback as
+        # short as possible on the hot path.
+        if app.playing:
+            _choke_next_step(step)
         _cv_tick(step)
         if app.playing and not app.ui_paused:
             app.led_row.light(step)
@@ -1251,8 +1616,10 @@ class Lane(UIElement):
             return
         self.kit_override = kit
         self.refresh_kit_btn()
-        configure_lane(self)  # re-point THIS lane's oscillator only
-        self.refresh_events() # vel may change if the new kit lacks this drum
+        # configure_lane re-points this lane's oscillator AND re-sends its
+        # amp (which is 0 when the new kit lacks a sample for this role, so
+        # the gate closes automatically). No event rebuild needed.
+        configure_lane(self)
 
     def set_bus(self, bus):
         bus = bus % NUM_BUSES
@@ -1271,15 +1638,14 @@ class Lane(UIElement):
         return True
 
     def out_vel(self):
-        """The velocity this lane's events should fire at right now.
-        Muted / soloed-out / zero-volume / transport-stopped / no sample
-        for this role on the current kit => MUTE_VEL (effectively
-        silent, same as a GM kit simply lacking that drum). Otherwise the
-        lane volume."""
-        if (self.has_sample() and app is not None and app.playing
-                and self.audible() and self.vol > 0.0):
-            return self.vol
-        return MUTE_VEL
+        """The note-on velocity every one of this lane's events fires at:
+        a constant full-scale trigger. Loudness AND gating (volume, mute,
+        solo, transport, no-sample) all live on the oscillator's amp now
+        (see lane_amp), so the events never have to change - which is what
+        lets volume/mute/solo/transport/kit changes avoid a sequence
+        rebuild entirely. A closed gate is amp 0, which AMY renders as
+        silence, so the fixed 1.0 here is safe even for a muted lane."""
+        return 1.0
 
     # -- AMYSequence event bookkeeping (off the audio path) --
 
@@ -1314,22 +1680,24 @@ class Lane(UIElement):
             self._add_event(step)
 
     def refresh_events(self):
-        """Update existing events in place (velocity changed - the
-        oscillator number itself never changes). Rebuilds if an event is
-        missing."""
+        """Re-send this lane's events at the current ON/OFF gate velocity
+        (mute/solo/transport changed - never volume any more, that goes
+        straight to the oscillator amp). Coalesced into one sequence
+        rebuild via _seq_batch, and safe to call inside an outer batch."""
         if app.seq is None:
             return
         kw = dict(osc=self._osc, vel=self.out_vel())
-        for step in self.step_set:
-            e = self.events.get(step)
-            if e is None:
-                self._add_event(step)
-            else:
-                try:
-                    e.update(step, amy.send, [], **kw)
-                except Exception:
-                    self._remove_event(step)
+        with _seq_batch():
+            for step in self.step_set:
+                e = self.events.get(step)
+                if e is None:
                     self._add_event(step)
+                else:
+                    try:
+                        e.update(step, amy.send, [], **kw)
+                    except Exception:
+                        self._remove_event(step)
+                        self._add_event(step)
 
     def refresh_kit_btn_and_events(self):
         self.refresh_kit_btn()
@@ -1364,12 +1732,16 @@ class Lane(UIElement):
 
     def set_steps(self, steps):
         want = set(steps)
-        for s in list(self.step_set):
-            if s not in want:
-                self.set_step(s, False)
-        for s in want:
-            if s not in self.step_set:
-                self.set_step(s, True)
+        # one batch: a whole-lane rewrite is a single sequence rebuild
+        # instead of one per added/removed step (each remove() would
+        # otherwise re-send every surviving event on its own)
+        with _seq_batch():
+            for s in list(self.step_set):
+                if s not in want:
+                    self.set_step(s, False)
+            for s in want:
+                if s not in self.step_set:
+                    self.set_step(s, True)
         # note: callers that use set_steps for bulk loads (apply_preset,
         # apply_pattern_snapshot, _apply_bank) call _auto_save_slot()
         # themselves AFTER loading all lanes, not per-lane here, to
@@ -1380,13 +1752,15 @@ class Lane(UIElement):
     def mute_cb(self, e=None):
         self.muted = not self.muted
         self.mute_btn.set_color(C_MUTE_ON if self.muted else C_BTN)
-        refresh_all_events()      # audibility affects every lane via solo
+        # gate lives on amp now: one amp message per lane, no rebuild.
+        # (all lanes, because solo makes one lane's state affect the rest)
+        refresh_all_amps()
 
     def solo_cb(self, e=None):
         self.solo = not self.solo
         self.solo_btn.set_color(C_SOLO_ON if self.solo else C_BTN)
         update_solo_state()
-        refresh_all_events()
+        refresh_all_amps()
 
     def rnd_cb(self, e=None):
         self.set_steps(random_steps(self.name))
@@ -1399,8 +1773,19 @@ class Lane(UIElement):
         app.kit_popup.show(self.row_i)
 
     def set_vol(self, v):
-        self.vol = clampf(v, 0.0, 1.0)
-        self.refresh_events()     # events fire at the new velocity
+        # round for the same reason as fx_set: keep repeated +/-0.05 steps
+        # from drifting to values like 1e-17 that would reach the wire in
+        # exponent form (amy.py's trunc handles the amp float here, but
+        # rounding keeps the stored value, the % label and saved JSON clean)
+        self.vol = round(clampf(v, 0.0, 1.0), 6)
+        # Volume is the oscillator's amp gain now, not the event velocity:
+        # ONE amy.send to this lane's own oscillator, no sequence rebuild.
+        # This is the change that keeps a volume drag from stuttering
+        # playback - the events AMY is sequencing are never touched.
+        try:
+            _amy_fx(osc=self._osc, amp=lane_amp(self))
+        except Exception:
+            pass
 
 
 
@@ -1575,16 +1960,22 @@ class KitPopup:
     def __init__(self, parent):
         self.lane_i = None
         self.panel = lv.obj(parent)
-        self.panel.set_size(760, 130)
+        # Widened from 760 so the last kit button (Percussion) isn't clipped
+        # at the right edge. Eight buttons - Global + 7 kits - at pitch 92
+        # end at 16 + 92 + 7*92 = 752; an 820-wide, un-padded panel leaves
+        # a comfortable margin past that. lv_depad() removes the default
+        # inner padding that was shifting the whole row right.
+        self.panel.set_size(820, 130)
         self.panel.set_style_bg_color(lv_color(C_PANEL), 0)
         self.panel.set_style_radius(8, 0)
         self.panel.align_to(parent, lv.ALIGN.CENTER, 0, 0)
         self.panel.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.panel)
 
         self.title = lv.label(self.panel)
         self.title.set_text("Kit")
         self.title.align_to(self.panel, lv.ALIGN.LEFT_MID, 16, -44)
-        Button(self.panel, "Close", 650, 90, 36, self.close, C_BTN, -44)
+        Button(self.panel, "Close", 714, 90, 36, self.close, C_BTN, -44)
 
         self.buttons = [Button(self.panel, "Global", 16, 92, 46,
                                 self.make_cb(None), C_KIT_BTN, 20)]
@@ -1672,16 +2063,45 @@ class FXPage:
     Y_STEP = 45
 
     def __init__(self, parent):
-        self.panel = lv.obj(parent)
+        # The FX page lives on its OWN LVGL screen, not as a panel overlaid
+        # on the sequencer's group. Switching to it is a single
+        # lv.screen_load() - the same mechanism Tulip's UIScreen.present()
+        # uses - so the sequencer's ~250 grid objects are simply not in the
+        # render tree while FX is up, and coming back is one screen load
+        # rather than un-hiding every widget one at a time (which is what
+        # made the playhead hitch on the way back). `parent` is no longer
+        # used for the panel; kept for signature compatibility.
+        #
+        # This mirrors UIScreen exactly: a bare lv.obj() screen (left at its
+        # default display size), with a screen_size()-sized group pinned at
+        # the top-left that everything else is centred within - so CENTER is
+        # the middle of the visible UI area, not of a possibly double-width
+        # raw screen.
+        self.screen = lv.obj()          # a top-level screen (no parent)
+        self.fxgroup = lv.obj(self.screen)
+        try:
+            gw, gh = tulip.screen_size()
+        except Exception:
+            gw, gh = 1024, 600
+        self.fxgroup.set_width(gw)
+        self.fxgroup.set_height(gh)
+        self.fxgroup.set_style_radius(0, 0)
+        self.fxgroup.set_style_border_width(0, 0)
+        self.fxgroup.set_style_bg_color(lv_color(0), 0)   # match app bg
+        self.fxgroup.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.fxgroup)
+
+        self.panel = lv.obj(self.fxgroup)
         self.panel.set_size(1000, 470)
         self.panel.set_style_bg_color(lv_color(C_PANEL), 0)
         self.panel.set_style_radius(8, 0)
-        self.panel.align_to(parent, lv.ALIGN.CENTER, 0, 0)
+        self.panel.align_to(self.fxgroup, lv.ALIGN.CENTER, 0, 0)
         self.panel.remove_flag(lv.obj.FLAG.SCROLLABLE)
 
         title = lv.label(self.panel)
         title.set_text("FX  -  each bus has its own reverb, echo and EQ. "
-                        "Tap a lane below to move it onto this bus.")
+                        "Tap a lane to move it onto this bus; tap it again "
+                        "to send it back to bus 0.")
         title.align_to(self.panel, lv.ALIGN.LEFT_MID, 20, FXPage.Y_TITLE)
         Button(self.panel, "Close", 860, 110, 44, self.close, C_BTN,
                 FXPage.Y_TITLE)
@@ -1766,21 +2186,34 @@ class FXPage:
 
     def make_assign(self, lane_i):
         def _cb(e=None):
-            app.rows[lane_i].set_bus(app.fx_bus)
+            lane = app.rows[lane_i]
+            # Toggle: tap a lane to put it on the bus you're viewing; tap it
+            # again (while it's already here) to take it off and send it
+            # back to bus 0. On bus 0 itself there's nowhere to toggle back
+            # to, so a tap there just (re)assigns to 0.
+            if lane.bus == app.fx_bus and app.fx_bus != 0:
+                lane.set_bus(0)
+            else:
+                lane.set_bus(app.fx_bus)
             self.refresh()
         return _cb
 
     def cycle_filter(self, e=None):
         f = app.bus_fx[app.fx_bus]
         f["filter_type"] = (f["filter_type"] + 1) % 3
-        apply_bus_fx(app.fx_bus)
+        # only the per-osc filter changed - re-route just this bus's lanes,
+        # coalesced (no need to resend reverb/echo/eq)
+        _fx_queue(app.fx_bus, "slot")
         self.refresh()
 
     def reset_fx(self, e=None):
         f = app.bus_fx[app.fx_bus]
         for k in BUS_FX_DEFAULTS:
             f[k] = BUS_FX_DEFAULTS[k]
-        apply_bus_fx(app.fx_bus)
+        # everything on this bus changed - queue all groups, coalesced into
+        # a single flush rather than a full synchronous bus+lane resync
+        for g in ("reverb", "echo", "eq", "slot"):
+            _fx_queue(app.fx_bus, g)
         self.refresh()
 
     def refresh(self):
@@ -1799,47 +2232,258 @@ class FXPage:
             pass
 
     def show(self):
-        # switch to the FX page: hide the sequencer view and pause the
-        # visual playhead so nothing is drawing the grid behind us. Audio
-        # keeps running - only the visuals pause.
+        # switch to the FX page: load its own screen. The sequencer screen
+        # is left untouched (not rendered), and the visual playhead is
+        # paused - audio keeps running, only the visuals pause.
         app.ui_paused = True
-        set_sequencer_view(False)
         self.refresh()
-        self.panel.remove_flag(lv.obj.FLAG.HIDDEN)
-        self.panel.move_foreground()
+        try:
+            lv.screen_load(self.screen)
+        except Exception as ex:
+            print("fx show failed:", ex)
 
     def close(self, e=None):
         self.hide()
 
     def hide(self):
-        self.panel.add_flag(lv.obj.FLAG.HIDDEN)
-        # back to the sequencer page: clear the LED row, show the grid
-        # again, and let it resume lighting from the current step.
-        set_sequencer_view(True)
+        # back to the sequencer page: load the app's own screen in one
+        # swap, then let the playhead resume lighting from the current step
+        try:
+            lv.screen_load(app.screen)
+        except Exception as ex:
+            print("fx hide failed:", ex)
         clear_leds()
         app.ui_paused = False
 
 
-def set_sequencer_view(visible):
-    """Show or hide the entire drum-sequencer view as one page. Used so
-    the FX page is a real separate page rather than an overlay composited
-    on top of the grid - only one of the two is ever on screen."""
-    widgets = [app.header, app.header2, app.top_spacer, app.led_row,
-               app.led_spacer, app.mid_spacer, app.bank_row] + list(app.rows)
-    for w in widgets:
-        if w is None:
-            continue
+def open_fx(e=None):
+    app.fx_page.show()
+
+
+# --- KITS page: pick the PCM sample for each part of a kit -------------
+#
+# Lives on its own LVGL screen, like the FX page, so opening/closing it is
+# one screen_load and never disturbs the sequence. You pick a kit, then a
+# part (Kick/Snare/...), and a scrollable list of that kit's available
+# samples (its own bank + the acoustic and extras utility banks) drops in.
+# Tapping a sample assigns it live AND auditions it on the scratch osc.
+# Assignments are per-project overrides (see set_kit_sample) and save with
+# the project.
+
+class KitsPage:
+    _ITEM_H = 32                       # height of one row in the sample list
+    _MAX_ITEMS = 64                    # >= 1 (OFF) + biggest pool
+
+    def __init__(self, parent):
+        self.edit_kit = 0
+        self.pick_role = None
+        self._pool = []                # [(preset, name)] currently listed
+
+        # own screen + a screen_size group pinned top-left (mirrors UIScreen
+        # and FXPage), everything centred inside it
+        self.screen = lv.obj()
+        self.kgroup = lv.obj(self.screen)
         try:
-            if visible:
-                w.group.remove_flag(lv.obj.FLAG.HIDDEN)
-            else:
-                w.group.add_flag(lv.obj.FLAG.HIDDEN)
+            gw, gh = tulip.screen_size()
+        except Exception:
+            gw, gh = 1024, 600
+        self.kgroup.set_width(gw)
+        self.kgroup.set_height(gh)
+        self.kgroup.set_style_radius(0, 0)
+        self.kgroup.set_style_border_width(0, 0)
+        self.kgroup.set_style_bg_color(lv_color(0), 0)
+        self.kgroup.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.kgroup)
+
+        self.panel = lv.obj(self.kgroup)
+        self.panel.set_size(1000, 470)
+        self.panel.set_style_bg_color(lv_color(C_PANEL), 0)
+        self.panel.set_style_radius(8, 0)
+        self.panel.align_to(self.kgroup, lv.ALIGN.CENTER, 0, 0)
+        self.panel.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.panel)
+
+        title = lv.label(self.panel)
+        title.set_text("KITS  -  choose the sample for each part of a kit. "
+                        "Pick a kit, tap a part, then tap a sample.")
+        title.align_to(self.panel, lv.ALIGN.LEFT_MID, 20, -205)
+        Button(self.panel, "Close", 880, 90, 44, self.close, C_BTN, -205)
+
+        # kit selector
+        Button(self.panel, "< KIT", 20, 90, 40, self.kit_prev, C_KIT_ON, -150)
+        self.kit_value = lv.label(self.panel)
+        self.kit_value.set_text(KITS[0][1])
+        self.kit_value.align_to(self.panel, lv.ALIGN.LEFT_MID, 124, -150)
+        Button(self.panel, "KIT >", 220, 90, 40, self.kit_next, C_KIT_ON, -150)
+        Button(self.panel, "RESET KIT", 360, 130, 40, self.reset_kit,
+                C_BTN, -150)
+
+        # one row per drum part: label, current sample name, Change button
+        self.role_rows = []
+        y0 = -92
+        for i, (role, _note, _vol) in enumerate(ELEMENTS):
+            y = y0 + i * 40
+            rl = lv.label(self.panel)
+            rl.set_text(role)
+            rl.align_to(self.panel, lv.ALIGN.LEFT_MID, 40, y)
+            sl = lv.label(self.panel)
+            sl.set_text("")
+            sl.align_to(self.panel, lv.ALIGN.LEFT_MID, 170, y)
+            Button(self.panel, "Change", 560, 120, 32,
+                    self._make_open(role), C_KIT_BTN, y)
+            self.role_rows.append((role, sl))
+
+        # --- the sample picker overlay (scrollable list) ---
+        self.picker = lv.obj(self.kgroup)
+        self.picker.set_size(640, 470)
+        self.picker.set_style_bg_color(lv_color(C_PANEL), 0)
+        self.picker.set_style_radius(8, 0)
+        self.picker.align_to(self.kgroup, lv.ALIGN.CENTER, 0, 0)
+        self.picker.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.picker)
+
+        self.picker_title = lv.label(self.picker)
+        self.picker_title.set_text("Sample")
+        self.picker_title.align_to(self.picker, lv.ALIGN.TOP_LEFT, 20, 16)
+        Button(self.picker, "Back", 520, 96, 40, self.close_picker, C_BTN, 0)
+
+        # scrollable box holding the reusable item rows
+        self.list_box = lv.obj(self.picker)
+        self.list_box.set_size(600, 384)
+        self.list_box.align_to(self.picker, lv.ALIGN.TOP_LEFT, 20, 60)
+        self.list_box.set_style_bg_color(lv_color(C_BANK_EMPTY), 0)
+        self.list_box.set_style_radius(6, 0)
+        lv_depad(self.list_box)
+        try:
+            self.list_box.set_scroll_dir(lv.DIR.VER)
         except Exception:
             pass
 
+        self.items = []                # reusable rows: (obj, label)
+        for i in range(KitsPage._MAX_ITEMS):
+            o = lv.obj(self.list_box)
+            o.set_size(560, KitsPage._ITEM_H - 4)
+            o.set_style_radius(4, 0)
+            o.set_style_bg_color(lv_color(C_KIT_BTN), 0)
+            o.align_to(self.list_box, lv.ALIGN.TOP_LEFT, 6,
+                        6 + i * KitsPage._ITEM_H)
+            o.remove_flag(lv.obj.FLAG.SCROLLABLE)
+            lv_depad(o)
+            o.add_event_cb(self._make_pick(i), lv.EVENT.CLICKED, None)
+            lab = lv.label(o)
+            lab.set_text("")
+            lab.align_to(o, lv.ALIGN.LEFT_MID, 8, 0)
+            o.add_flag(lv.obj.FLAG.HIDDEN)
+            self.items.append((o, lab))
 
-def open_fx(e=None):
-    app.fx_page.show()
+        self.picker.add_flag(lv.obj.FLAG.HIDDEN)   # picker starts closed
+
+    # -- kit selector --
+    def kit_prev(self, e=None):
+        self.edit_kit = (self.edit_kit - 1) % len(KITS)
+        self.close_picker()
+        self.refresh()
+
+    def kit_next(self, e=None):
+        self.edit_kit = (self.edit_kit + 1) % len(KITS)
+        self.close_picker()
+        self.refresh()
+
+    def reset_kit(self, e=None):
+        """Drop every override for the kit being edited, reverting it to its
+        built-in samples, and re-point any live lanes that follow it."""
+        app.kit_overrides.pop(self.edit_kit, None)
+        for r in app.rows:
+            eff = r.kit_override if r.kit_override is not None else app.kit_idx
+            if eff == self.edit_kit:
+                configure_lane(r)
+        self.close_picker()
+        self.refresh()
+
+    # -- role rows --
+    def _make_open(self, role):
+        def _cb(e=None):
+            self.open_picker(role)
+        return _cb
+
+    def refresh(self):
+        try:
+            self.kit_value.set_text(KITS[self.edit_kit][1])
+            for role, sl in self.role_rows:
+                preset = kit_role_preset(self.edit_kit, role)
+                sl.set_text(sample_name(preset))
+        except Exception:
+            pass
+
+    # -- sample picker --
+    def open_picker(self, role):
+        self.pick_role = role
+        self._pool = [(NO_SAMPLE, "OFF (silent)")] + kit_sample_pool(self.edit_kit)
+        cur = kit_role_preset(self.edit_kit, role)
+        self.picker_title.set_text("%s  /  %s" % (KITS[self.edit_kit][1], role))
+        n = min(len(self._pool), KitsPage._MAX_ITEMS)
+        for i in range(KitsPage._MAX_ITEMS):
+            o, lab = self.items[i]
+            if i < n:
+                preset, name = self._pool[i]
+                lab.set_text(name)
+                o.set_style_bg_color(
+                    lv_color(C_KIT_ON if preset == cur else C_KIT_BTN), 0)
+                o.remove_flag(lv.obj.FLAG.HIDDEN)
+            else:
+                o.add_flag(lv.obj.FLAG.HIDDEN)
+        try:
+            self.list_box.scroll_to_y(0, lv.ANIM.OFF)
+        except Exception:
+            pass
+        self.picker.remove_flag(lv.obj.FLAG.HIDDEN)
+        self.picker.move_foreground()
+
+    def close_picker(self, e=None):
+        self.pick_role = None
+        self.picker.add_flag(lv.obj.FLAG.HIDDEN)
+
+    def _make_pick(self, i):
+        def _cb(e=None):
+            if self.pick_role is None or i >= len(self._pool):
+                return
+            preset, _name = self._pool[i]
+            audition_preset(preset)
+            set_kit_sample(self.edit_kit, self.pick_role, preset)
+            # re-highlight the list and update the part's name on the page
+            for j in range(min(len(self._pool), KitsPage._MAX_ITEMS)):
+                o, _lab = self.items[j]
+                sel = (self._pool[j][0] == preset)
+                o.set_style_bg_color(
+                    lv_color(C_KIT_ON if sel else C_KIT_BTN), 0)
+            self.refresh()
+        return _cb
+
+    # -- page show/hide (own screen) --
+    def show(self):
+        self.edit_kit = app.kit_idx     # start on the kit that's playing
+        self.close_picker()
+        self.refresh()
+        app.ui_paused = True
+        try:
+            lv.screen_load(self.screen)
+        except Exception as ex:
+            print("kits show failed:", ex)
+
+    def close(self, e=None):
+        self.hide()
+
+    def hide(self):
+        try:
+            lv.screen_load(app.screen)
+        except Exception as ex:
+            print("kits hide failed:", ex)
+        clear_leds()
+        app.ui_paused = False
+
+
+def open_kits(e=None):
+    app.kits_page.show()
 
 
 # --- pattern bank strip --------------------------------------------------
@@ -1944,9 +2588,11 @@ class HeaderTop(UIElement):
         Button(self.group, "+", 724, 44, HDR_BTN_H, bpm_up,
                 repeat_cb=bpm_up_fast)
 
-        Button(self.group, "FX", 790, 90, HDR_BTN_H, open_fx,
+        Button(self.group, "FX", 770, 60, HDR_BTN_H, open_fx,
                 rgb332(150, 90, 200))
-        self.restart_btn = Button(self.group, "RESTART", 890, 110,
+        Button(self.group, "KITS", 836, 66, HDR_BTN_H, open_kits,
+                rgb332(150, 90, 200))
+        self.restart_btn = Button(self.group, "RESTART", 908, 92,
                                    HDR_BTN_H, restart_audio, C_RESTART)
 
     def set_pattern(self, t):
@@ -2005,15 +2651,14 @@ class HeaderBottom(UIElement):
 
 def apply_kit(idx):
     """Change the global kit. Re-points only the lanes that follow it
-    (no per-lane override) - each is one short osc message to that
-    lane's own fixed oscillator, plus an event-velocity refresh in case
-    the new kit doesn't have a sample for that role. No reset, no
-    sequence rebuild."""
+    (no per-lane override) - each is a couple of short osc messages to
+    that lane's own fixed oscillator (new sample, route, and amp, the amp
+    gating the lane silent if the new kit lacks its drum). No reset, and
+    no sequence rebuild - the events are untouched."""
     app.kit_idx = idx % len(KITS)
     for r in app.rows:
         if r.kit_override is None:
             configure_lane(r)
-            r.refresh_events()
     if app.header is not None:
         app.header.set_kit(KITS[app.kit_idx][1])
 
@@ -2031,8 +2676,11 @@ def apply_preset(idx):
     app.pat_idx = idx
     name = PRESETS[idx][0]
     steps_map = PRESETS[idx][1]
-    for r in app.rows:
-        r.set_steps(steps_map.get(r.name, []))
+    # one outer batch around all seven lanes -> a preset load is a single
+    # sequence rebuild, not one per lane
+    with _seq_batch():
+        for r in app.rows:
+            r.set_steps(steps_map.get(r.name, []))
     app.header.set_pattern(name)
     _auto_save_slot()
 
@@ -2046,8 +2694,9 @@ def pattern_next(e=None):
 
 
 def clear_all(e=None):
-    for r in app.rows:
-        r.set_steps([])
+    with _seq_batch():           # single rebuild for the whole grid
+        for r in app.rows:
+            r.set_steps([])
     _auto_save_slot()
     app.header.set_pattern("(empty)")
 
@@ -2162,11 +2811,12 @@ def apply_pattern_snapshot(pat):
     steps = pat.get("steps", {})
     if not isinstance(steps, dict):
         steps = {}
-    for r in app.rows:
-        s = steps.get(r.name, [])
-        if not isinstance(s, list):
-            s = []
-        r.set_steps(s)
+    with _seq_batch():           # one rebuild for the whole loaded grid
+        for r in app.rows:
+            s = steps.get(r.name, [])
+            if not isinstance(s, list):
+                s = []
+            r.set_steps(s)
 
 
 def snapshot_project():
@@ -2186,6 +2836,9 @@ def snapshot_project():
         "bus_fx": [dict(f) for f in app.bus_fx],
         "bank": [_deep_copy_pattern(p) for p in app.bank_patterns],
         "bank_active": app.bank_active,
+        # KITS-page sample overrides; JSON keys must be strings
+        "kit_overrides": {str(k): dict(v)
+                          for k, v in app.kit_overrides.items()},
     }
 
 
@@ -2196,6 +2849,26 @@ def apply_project_snapshot(proj):
     kit + bpm) must never be able to crash the app."""
     if not isinstance(proj, dict):
         return
+
+    # KITS-page sample overrides FIRST, so the configure_lane calls that
+    # follow (via apply_kit and the per-lane loop) pick up the right
+    # samples. Defensive: ignore anything malformed field by field.
+    app.kit_overrides = {}
+    ko = proj.get("kit_overrides", None)
+    if isinstance(ko, dict):
+        for ks, roles in ko.items():
+            try:
+                ki = int(ks)
+            except Exception:
+                continue
+            if not (0 <= ki < len(SAMPLE_KITS)) or not isinstance(roles, dict):
+                continue
+            clean = {}
+            for role, preset in roles.items():
+                if isinstance(role, str) and isinstance(preset, int):
+                    clean[role] = preset
+            if clean:
+                app.kit_overrides[ki] = clean
 
     kit = proj.get("kit", None)
     if isinstance(kit, int) and 0 <= kit < len(KITS):
@@ -2244,7 +2917,6 @@ def apply_project_snapshot(proj):
             s = entry.get("steps", [])
             r.set_steps(s if isinstance(s, list) else [])
         update_solo_state()
-        refresh_all_events()
     else:
         # older save format: a flat {"steps": {lane_name: [..]}} dict
         steps = proj.get("steps", {})
@@ -2272,6 +2944,10 @@ def apply_project_snapshot(proj):
     active_slot = app.bank_patterns[app.bank_active]
     if isinstance(active_slot, dict):
         apply_pattern_snapshot(active_slot)
+    # amp carries both level and gate now, so one pass here brings every
+    # lane's oscillator in line with the fully-loaded vol/mute/solo/kit
+    # state - all the audio update a project load needs, no event rebuild
+    refresh_all_amps()
     if app.bank_row is not None:
         app.bank_row.refresh()
 
@@ -2413,7 +3089,7 @@ def _save_transport_hold(on):
             activate_buses()
             configure_all_lanes()
             apply_all_fx()
-            refresh_all_events()
+            refresh_all_amps()    # gate/level ride on amp now, not events
         except Exception as ex:
             print("[save] full restart failed:", ex)
 
@@ -2774,7 +3450,9 @@ def toggle_play(e=None):
 def _apply_transport(playing):
     app.playing = playing
     app.pending_play = None
-    refresh_all_events()      # events fire at vol when playing, else MUTE_VEL
+    # start/stop is now a gate on amp (0 when stopped), not an event
+    # rewrite: one amp message per lane, no sequence rebuild at the bar edge
+    refresh_all_amps()
     if not playing:
         clear_leds()
     cv_transport(playing)     # the rack starts/stops with the app
@@ -3416,6 +4094,25 @@ def quit(screen):
         screen.led_seq = None
     except Exception:
         pass
+    # the FX and KITS pages each own their own top-level LVGL screen;
+    # delete them so a re-run doesn't leak one each time. Load the app's
+    # screen first in case one of them was active, so LVGL is never left
+    # on a deleted screen.
+    for _attr in ("fx_page", "kits_page"):
+        try:
+            pg = getattr(screen, _attr, None)
+            if pg is not None and getattr(pg, "screen", None) is not None:
+                try:
+                    lv.screen_load(screen.screen)
+                except Exception:
+                    pass
+                try:
+                    pg.screen.delete()
+                except Exception:
+                    pass
+                pg.screen = None
+        except Exception:
+            pass
 
 
 def run(screen):
@@ -3472,6 +4169,9 @@ def run(screen):
         for k in BUS_FX_DEFAULTS:
             f[k] = BUS_FX_DEFAULTS[k]
         app.bus_fx.append(f)
+    # per-project sample overrides from the KITS page: {kit_idx: {role: preset}}
+    app.kit_overrides = {}
+    app.kits_page = None
     app.user_projects = load_user_projects()
 
     app.rows = []
@@ -3502,6 +4202,7 @@ def run(screen):
     app.save_popup = SaveProjectPopup(app.group)
     app.kit_popup = KitPopup(app.group)
     app.fx_page = FXPage(app.group)
+    app.kits_page = KitsPage(app.group)
 
     app.bank_row.refresh_cv()
     if CV_AUTOSTART:
