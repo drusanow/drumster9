@@ -2174,7 +2174,11 @@ class FXPage:
                                 "eq_m", -15.0, 15.0, 1.0, "%.0f", True))
         self.rows.append(FXRow(self.panel, y0 + 6 * ys, "EQ high dB",
                                 "eq_h", -15.0, 15.0, 1.0, "%.0f", True))
-        self.panel.add_flag(lv.obj.FLAG.HIDDEN)   # start hidden
+        # The panel is always visible; the FX page is hidden/shown by
+        # loading its own screen (see show/hide), NOT by a HIDDEN flag on
+        # the panel. Leaving the old overlay-era HIDDEN flag on here made
+        # the whole screen render black with no way out (Close was hidden
+        # too), since show() only calls screen_load and never un-hides it.
 
     def bus_prev(self, e=None):
         app.fx_bus = (app.fx_bus - 1) % NUM_BUSES
