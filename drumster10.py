@@ -220,6 +220,120 @@ SAMPLE_KITS = [
 ]
 KITS = [(i, name) for i, (name, _roles) in enumerate(SAMPLE_KITS)]
 
+# --- PCM sample banks (for the KITS page) ------------------------------
+#
+# Every PCM sample in the Gamma9001 set, grouped by bank, with its real
+# name from AMY's own manifest. Each tuple is (bank_key, label, first
+# preset, (name, name, ...)); the samples in a bank are contiguous, so a
+# sample's preset is `first + index_in_names`. On Tulip, TR-808 is baked
+# at presets 0..18 and the rest of the bank is memory-mapped starting at
+# preset 256 (GAMMA9001_BASE), which is why the non-808 banks start there.
+# This is a static table (the device has no network) generated from
+# github.com/shorepine/amy/blob/main/sounds/gamma9001/manifest.json.
+PCM_BANKS = [
+    ("tr808", "TR-808", 0, (
+        "TR-808 Bass Drum 1", "TR-808 Bass Drum 2", "TR-808 Bass Drum 3",
+        "TR-808 Clap", "TR-808 Clave", "TR-808 Conga Hi", "TR-808 Conga Lo",
+        "TR-808 Conga Mid", "TR-808 Cowbell", "TR-808 HiHat Closed",
+        "TR-808 HiHat Open", "TR-808 Shaker", "TR-808 Snare 1",
+        "TR-808 Snare 2", "TR-808 Snare 3", "TR-808 Rimshot",
+        "TR-808 Tom Lo", "TR-808 Tom Hi", "TR-808 Cymbal",
+    )),
+    ("tr909", "TR-909", 256, (
+        "909BD", "909BD-LO", "909CLAP", "909CRASH", "909HH", "909HH-LONG",
+        "909HH-SHORT", "909OH", "909OH-LONG", "909OH-SHORT", "909RIDE",
+        "909RIM", "909SD", "909SD-SHORT", "909TOM-HI", "909TOM-LO",
+        "909TOM-MID",
+    )),
+    ("linn9000", "Linn 9000", 273, (
+        "BassDrum 1", "Bongo 3", "CowBell 1", "Cymbal 2", "HiHat Closed 3",
+        "HiHat Open 2", "RimShoot 1", "SnareDrum 1", "Taburine 1",
+        "TomTom 2",
+    )),
+    ("mr12", "MR-12", 283, (
+        "MR-12#HHC", "MR-12#HHO", "MR-12#KICK", "MR-12#SNR",
+    )),
+    ("synthetics", "Tokyo Syn", 287, (
+        "Metallic 09", "Metallic 16", "Static 07", "Wooden 01", "Wooden 02",
+        "Wooden 03", "BD 03", "BD 04", "BD 07", "Tokyo Burst bd",
+        "Tokyo Deep bd", "Tokyo Jet bd", "Tokyo Space", "Hizz 06", "Pew 03",
+        "Boink 02", "Boink 04", "Blop 01", "Blop 02", "Click 05", "Click 06",
+        "Click 07", "Click 08", "Click 09",
+    )),
+    ("power", "80s Power", 311, (
+        "Real Kick", "Metal Kick", "Side Stick", "Power Snare", "Hand Claps",
+        "Gated Snare", "Process Tom 1", "Tight HiHat", "Process Tom 2",
+        "Pedal HiHat", "Process Tom 3", "Open HiHat", "Process Tom 4",
+        "Process Tom 5", "Crash Cymbal", "Process Tom 6", "Ride Edge",
+        "Ride Cup", "Splash Cymbal", "Cowbell",
+    )),
+    ("percussion", "Percussion", 331, (
+        "African Conga 001", "African Conga 002", "African Conga 003",
+        "African Conga 004", "Bongo 001", "Bongo 002", "Bongo 003",
+        "Bongo 004", "Bongo 005", "Bongo 006", "Bongo 007", "Conga 001",
+        "Conga 002", "Conga 003", "Conga 004", "Conga 005", "Conga 006",
+        "Digeridoo", "Kanu 001", "Noice Kick", "Old Snare", "Simple Shaker",
+        "Simple Shaker 002", "Sitar", "Strings Tutti 001",
+        "Strings Tutti 002", "Strings sweep", "Tabla 001", "Tabla 002",
+        "Tabla 003", "Tamb 001", "Tamb 003", "Tamb 004", "Tamp 002",
+        "Timbales 001", "Timbales 002", "Timbales 003", "Timbales 004",
+        "Timpani 001", "Timpani 002", "Triangle 001", "Triangle 002",
+        "Untitled", "Wistle 001",
+    )),
+    ("acoustic", "Acoustic", 375, (
+        "Tambourine Short", "Shaker Short", "Shaker Tiny",
+    )),
+    ("extras", "Extras", 378, (
+        "JCave", "Laser", "Mach3", "Silver", "Vibrablib", "HeHa", "HiHi",
+        "Dim Future", "Smiling", "Ana Strings", "BassRec", "Xox", "Beach",
+        "Narrow",
+    )),
+]
+
+# preset number -> sample name, built once from PCM_BANKS
+SAMPLE_NAMES = {}
+for _bk, _lbl, _start, _names in PCM_BANKS:
+    for _i, _nm in enumerate(_names):
+        SAMPLE_NAMES[_start + _i] = _nm
+
+# bank_key -> (label, first_preset, names)
+_BANK_BY_KEY = {bk: (lbl, start, names)
+                for (bk, lbl, start, names) in PCM_BANKS}
+
+# each kit's primary bank, in SAMPLE_KITS order (they line up with the
+# first seven PCM_BANKS entries: 808, 909, Linn, MR-12, Tokyo, Power, Perc)
+KIT_BANK_KEY = [PCM_BANKS[i][0] for i in range(len(SAMPLE_KITS))]
+
+# the extra "utility" banks every kit can also draw from - the acoustic
+# shakers/tambourine and the extras one-shots the kits already borrow
+UTILITY_BANK_KEYS = ("acoustic", "extras")
+
+
+def sample_name(preset):
+    """Human name for a PCM preset, or 'OFF' for no sample."""
+    if preset == NO_SAMPLE:
+        return "OFF"
+    return SAMPLE_NAMES.get(preset, "preset %d" % preset)
+
+
+def kit_sample_pool(kit_idx):
+    """The samples a kit may use for any of its roles: the kit's own bank
+    plus the acoustic and extras utility banks. Returns a list of
+    (preset, name), in bank order."""
+    keys = [KIT_BANK_KEY[kit_idx % len(KIT_BANK_KEY)]]
+    for k in UTILITY_BANK_KEYS:
+        if k not in keys:
+            keys.append(k)
+    pool = []
+    for k in keys:
+        info = _BANK_BY_KEY.get(k)
+        if not info:
+            continue
+        _lbl, start, names = info
+        for i, nm in enumerate(names):
+            pool.append((start + i, nm))
+    return pool
+
 # name, GM note (reference only - PCM oscillators play at native pitch,
 # so this is no longer used to address AMY, just documents each role),
 # default volume
@@ -588,6 +702,19 @@ def clampf(v, lo, hi):
 # Seven fixed oscillators is nothing against AMY's default budget of 180.
 # =====================================================================
 
+def kit_role_preset(kit_idx, role):
+    """Which PCM preset a kit uses for a role: a per-project override from
+    the KITS page if one exists, otherwise the built-in SAMPLE_KITS default."""
+    ov = None
+    if app is not None:
+        ov = getattr(app, "kit_overrides", None)
+    if ov is not None:
+        kov = ov.get(kit_idx)
+        if kov is not None and role in kov:
+            return kov[role]
+    return SAMPLE_KITS[kit_idx][1].get(role, NO_SAMPLE)
+
+
 def configure_lane(lane):
     """(Re)point this lane's fixed oscillator at the sample its current
     kit assigns to its role, and (re)apply its bus routing + filter/
@@ -595,7 +722,7 @@ def configure_lane(lane):
     messages, and ONLY for the lane(s) that actually changed."""
     role = lane.name
     kit_idx = lane.kit_override if lane.kit_override is not None else app.kit_idx
-    preset = SAMPLE_KITS[kit_idx][1].get(role, NO_SAMPLE)
+    preset = kit_role_preset(kit_idx, role)
     if preset != lane._preset:
         lane._preset = preset
         if preset != NO_SAMPLE:
@@ -606,6 +733,44 @@ def configure_lane(lane):
         # if NO_SAMPLE: nothing to configure - out_vel() gates the lane
         # silent below, exactly like a GM kit lacking that drum used to.
     apply_lane_route(lane)
+
+
+def set_kit_sample(kit_idx, role, preset):
+    """Set (or clear) the sample a kit uses for a role, from the KITS page.
+
+    Stored as a per-project override in app.kit_overrides; choosing the
+    built-in default drops the override so the kit reverts cleanly. Any
+    live lane currently playing this kit+role is re-pointed immediately -
+    a couple of osc messages, no sequence rebuild."""
+    default = SAMPLE_KITS[kit_idx][1].get(role, NO_SAMPLE)
+    ov = app.kit_overrides.get(kit_idx)
+    if preset == default:
+        if ov is not None and role in ov:
+            del ov[role]
+            if not ov:
+                app.kit_overrides.pop(kit_idx, None)
+    else:
+        if ov is None:
+            ov = {}
+            app.kit_overrides[kit_idx] = ov
+        ov[role] = preset
+    # re-point every live lane that follows this kit+role
+    for r in app.rows:
+        eff = r.kit_override if r.kit_override is not None else app.kit_idx
+        if eff == kit_idx and r.name == role:
+            configure_lane(r)
+
+
+def audition_preset(preset):
+    """Play a sample once on the scratch oscillator so it can be previewed
+    from the KITS page without disturbing the lanes that are playing."""
+    if preset == NO_SAMPLE:
+        return
+    try:
+        amy.send(osc=TEST_OSC, wave=amy.PCM, preset=preset)
+        amy.send(osc=TEST_OSC, vel=1)
+    except Exception as ex:
+        print("audition failed:", ex)
 
 
 def _gate_open(lane):
@@ -2095,6 +2260,232 @@ def open_fx(e=None):
     app.fx_page.show()
 
 
+# --- KITS page: pick the PCM sample for each part of a kit -------------
+#
+# Lives on its own LVGL screen, like the FX page, so opening/closing it is
+# one screen_load and never disturbs the sequence. You pick a kit, then a
+# part (Kick/Snare/...), and a scrollable list of that kit's available
+# samples (its own bank + the acoustic and extras utility banks) drops in.
+# Tapping a sample assigns it live AND auditions it on the scratch osc.
+# Assignments are per-project overrides (see set_kit_sample) and save with
+# the project.
+
+class KitsPage:
+    _ITEM_H = 32                       # height of one row in the sample list
+    _MAX_ITEMS = 64                    # >= 1 (OFF) + biggest pool
+
+    def __init__(self, parent):
+        self.edit_kit = 0
+        self.pick_role = None
+        self._pool = []                # [(preset, name)] currently listed
+
+        # own screen + a screen_size group pinned top-left (mirrors UIScreen
+        # and FXPage), everything centred inside it
+        self.screen = lv.obj()
+        self.kgroup = lv.obj(self.screen)
+        try:
+            gw, gh = tulip.screen_size()
+        except Exception:
+            gw, gh = 1024, 600
+        self.kgroup.set_width(gw)
+        self.kgroup.set_height(gh)
+        self.kgroup.set_style_radius(0, 0)
+        self.kgroup.set_style_border_width(0, 0)
+        self.kgroup.set_style_bg_color(lv_color(0), 0)
+        self.kgroup.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.kgroup)
+
+        self.panel = lv.obj(self.kgroup)
+        self.panel.set_size(1000, 470)
+        self.panel.set_style_bg_color(lv_color(C_PANEL), 0)
+        self.panel.set_style_radius(8, 0)
+        self.panel.align_to(self.kgroup, lv.ALIGN.CENTER, 0, 0)
+        self.panel.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.panel)
+
+        title = lv.label(self.panel)
+        title.set_text("KITS  -  choose the sample for each part of a kit. "
+                        "Pick a kit, tap a part, then tap a sample.")
+        title.align_to(self.panel, lv.ALIGN.LEFT_MID, 20, -205)
+        Button(self.panel, "Close", 880, 90, 44, self.close, C_BTN, -205)
+
+        # kit selector
+        Button(self.panel, "< KIT", 20, 90, 40, self.kit_prev, C_KIT_ON, -150)
+        self.kit_value = lv.label(self.panel)
+        self.kit_value.set_text(KITS[0][1])
+        self.kit_value.align_to(self.panel, lv.ALIGN.LEFT_MID, 124, -150)
+        Button(self.panel, "KIT >", 220, 90, 40, self.kit_next, C_KIT_ON, -150)
+        Button(self.panel, "RESET KIT", 360, 130, 40, self.reset_kit,
+                C_BTN, -150)
+
+        # one row per drum part: label, current sample name, Change button
+        self.role_rows = []
+        y0 = -92
+        for i, (role, _note, _vol) in enumerate(ELEMENTS):
+            y = y0 + i * 40
+            rl = lv.label(self.panel)
+            rl.set_text(role)
+            rl.align_to(self.panel, lv.ALIGN.LEFT_MID, 40, y)
+            sl = lv.label(self.panel)
+            sl.set_text("")
+            sl.align_to(self.panel, lv.ALIGN.LEFT_MID, 170, y)
+            Button(self.panel, "Change", 560, 120, 32,
+                    self._make_open(role), C_KIT_BTN, y)
+            self.role_rows.append((role, sl))
+
+        # --- the sample picker overlay (scrollable list) ---
+        self.picker = lv.obj(self.kgroup)
+        self.picker.set_size(640, 470)
+        self.picker.set_style_bg_color(lv_color(C_PANEL), 0)
+        self.picker.set_style_radius(8, 0)
+        self.picker.align_to(self.kgroup, lv.ALIGN.CENTER, 0, 0)
+        self.picker.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.picker)
+
+        self.picker_title = lv.label(self.picker)
+        self.picker_title.set_text("Sample")
+        self.picker_title.align_to(self.picker, lv.ALIGN.TOP_LEFT, 20, 16)
+        Button(self.picker, "Back", 520, 96, 40, self.close_picker, C_BTN, 0)
+
+        # scrollable box holding the reusable item rows
+        self.list_box = lv.obj(self.picker)
+        self.list_box.set_size(600, 384)
+        self.list_box.align_to(self.picker, lv.ALIGN.TOP_LEFT, 20, 60)
+        self.list_box.set_style_bg_color(lv_color(C_BANK_EMPTY), 0)
+        self.list_box.set_style_radius(6, 0)
+        lv_depad(self.list_box)
+        try:
+            self.list_box.set_scroll_dir(lv.DIR.VER)
+        except Exception:
+            pass
+
+        self.items = []                # reusable rows: (obj, label)
+        for i in range(KitsPage._MAX_ITEMS):
+            o = lv.obj(self.list_box)
+            o.set_size(560, KitsPage._ITEM_H - 4)
+            o.set_style_radius(4, 0)
+            o.set_style_bg_color(lv_color(C_KIT_BTN), 0)
+            o.align_to(self.list_box, lv.ALIGN.TOP_LEFT, 6,
+                        6 + i * KitsPage._ITEM_H)
+            o.remove_flag(lv.obj.FLAG.SCROLLABLE)
+            lv_depad(o)
+            o.add_event_cb(self._make_pick(i), lv.EVENT.CLICKED, None)
+            lab = lv.label(o)
+            lab.set_text("")
+            lab.align_to(o, lv.ALIGN.LEFT_MID, 8, 0)
+            o.add_flag(lv.obj.FLAG.HIDDEN)
+            self.items.append((o, lab))
+
+        self.picker.add_flag(lv.obj.FLAG.HIDDEN)   # picker starts closed
+
+    # -- kit selector --
+    def kit_prev(self, e=None):
+        self.edit_kit = (self.edit_kit - 1) % len(KITS)
+        self.close_picker()
+        self.refresh()
+
+    def kit_next(self, e=None):
+        self.edit_kit = (self.edit_kit + 1) % len(KITS)
+        self.close_picker()
+        self.refresh()
+
+    def reset_kit(self, e=None):
+        """Drop every override for the kit being edited, reverting it to its
+        built-in samples, and re-point any live lanes that follow it."""
+        app.kit_overrides.pop(self.edit_kit, None)
+        for r in app.rows:
+            eff = r.kit_override if r.kit_override is not None else app.kit_idx
+            if eff == self.edit_kit:
+                configure_lane(r)
+        self.close_picker()
+        self.refresh()
+
+    # -- role rows --
+    def _make_open(self, role):
+        def _cb(e=None):
+            self.open_picker(role)
+        return _cb
+
+    def refresh(self):
+        try:
+            self.kit_value.set_text(KITS[self.edit_kit][1])
+            for role, sl in self.role_rows:
+                preset = kit_role_preset(self.edit_kit, role)
+                sl.set_text(sample_name(preset))
+        except Exception:
+            pass
+
+    # -- sample picker --
+    def open_picker(self, role):
+        self.pick_role = role
+        self._pool = [(NO_SAMPLE, "OFF (silent)")] + kit_sample_pool(self.edit_kit)
+        cur = kit_role_preset(self.edit_kit, role)
+        self.picker_title.set_text("%s  /  %s" % (KITS[self.edit_kit][1], role))
+        n = min(len(self._pool), KitsPage._MAX_ITEMS)
+        for i in range(KitsPage._MAX_ITEMS):
+            o, lab = self.items[i]
+            if i < n:
+                preset, name = self._pool[i]
+                lab.set_text(name)
+                o.set_style_bg_color(
+                    lv_color(C_KIT_ON if preset == cur else C_KIT_BTN), 0)
+                o.remove_flag(lv.obj.FLAG.HIDDEN)
+            else:
+                o.add_flag(lv.obj.FLAG.HIDDEN)
+        try:
+            self.list_box.scroll_to_y(0, lv.ANIM.OFF)
+        except Exception:
+            pass
+        self.picker.remove_flag(lv.obj.FLAG.HIDDEN)
+        self.picker.move_foreground()
+
+    def close_picker(self, e=None):
+        self.pick_role = None
+        self.picker.add_flag(lv.obj.FLAG.HIDDEN)
+
+    def _make_pick(self, i):
+        def _cb(e=None):
+            if self.pick_role is None or i >= len(self._pool):
+                return
+            preset, _name = self._pool[i]
+            audition_preset(preset)
+            set_kit_sample(self.edit_kit, self.pick_role, preset)
+            # re-highlight the list and update the part's name on the page
+            for j in range(min(len(self._pool), KitsPage._MAX_ITEMS)):
+                o, _lab = self.items[j]
+                sel = (self._pool[j][0] == preset)
+                o.set_style_bg_color(
+                    lv_color(C_KIT_ON if sel else C_KIT_BTN), 0)
+            self.refresh()
+        return _cb
+
+    # -- page show/hide (own screen) --
+    def show(self):
+        self.edit_kit = app.kit_idx     # start on the kit that's playing
+        self.close_picker()
+        self.refresh()
+        app.ui_paused = True
+        try:
+            lv.screen_load(self.screen)
+        except Exception as ex:
+            print("kits show failed:", ex)
+
+    def close(self, e=None):
+        self.hide()
+
+    def hide(self):
+        try:
+            lv.screen_load(app.screen)
+        except Exception as ex:
+            print("kits hide failed:", ex)
+        clear_leds()
+        app.ui_paused = False
+
+
+def open_kits(e=None):
+    app.kits_page.show()
+
+
 # --- pattern bank strip --------------------------------------------------
 
 class PatternBankRow(UIElement):
@@ -2197,9 +2588,11 @@ class HeaderTop(UIElement):
         Button(self.group, "+", 724, 44, HDR_BTN_H, bpm_up,
                 repeat_cb=bpm_up_fast)
 
-        Button(self.group, "FX", 790, 90, HDR_BTN_H, open_fx,
+        Button(self.group, "FX", 770, 60, HDR_BTN_H, open_fx,
                 rgb332(150, 90, 200))
-        self.restart_btn = Button(self.group, "RESTART", 890, 110,
+        Button(self.group, "KITS", 836, 66, HDR_BTN_H, open_kits,
+                rgb332(150, 90, 200))
+        self.restart_btn = Button(self.group, "RESTART", 908, 92,
                                    HDR_BTN_H, restart_audio, C_RESTART)
 
     def set_pattern(self, t):
@@ -2443,6 +2836,9 @@ def snapshot_project():
         "bus_fx": [dict(f) for f in app.bus_fx],
         "bank": [_deep_copy_pattern(p) for p in app.bank_patterns],
         "bank_active": app.bank_active,
+        # KITS-page sample overrides; JSON keys must be strings
+        "kit_overrides": {str(k): dict(v)
+                          for k, v in app.kit_overrides.items()},
     }
 
 
@@ -2453,6 +2849,26 @@ def apply_project_snapshot(proj):
     kit + bpm) must never be able to crash the app."""
     if not isinstance(proj, dict):
         return
+
+    # KITS-page sample overrides FIRST, so the configure_lane calls that
+    # follow (via apply_kit and the per-lane loop) pick up the right
+    # samples. Defensive: ignore anything malformed field by field.
+    app.kit_overrides = {}
+    ko = proj.get("kit_overrides", None)
+    if isinstance(ko, dict):
+        for ks, roles in ko.items():
+            try:
+                ki = int(ks)
+            except Exception:
+                continue
+            if not (0 <= ki < len(SAMPLE_KITS)) or not isinstance(roles, dict):
+                continue
+            clean = {}
+            for role, preset in roles.items():
+                if isinstance(role, str) and isinstance(preset, int):
+                    clean[role] = preset
+            if clean:
+                app.kit_overrides[ki] = clean
 
     kit = proj.get("kit", None)
     if isinstance(kit, int) and 0 <= kit < len(KITS):
@@ -3678,23 +4094,25 @@ def quit(screen):
         screen.led_seq = None
     except Exception:
         pass
-    # the FX page owns its own top-level LVGL screen; delete it so a
-    # re-run doesn't leak one each time. Load the app's screen first in
-    # case FX was the active one, so LVGL is never left on a deleted screen.
-    try:
-        fx = getattr(screen, "fx_page", None)
-        if fx is not None and getattr(fx, "screen", None) is not None:
-            try:
-                lv.screen_load(screen.screen)
-            except Exception:
-                pass
-            try:
-                fx.screen.delete()
-            except Exception:
-                pass
-            fx.screen = None
-    except Exception:
-        pass
+    # the FX and KITS pages each own their own top-level LVGL screen;
+    # delete them so a re-run doesn't leak one each time. Load the app's
+    # screen first in case one of them was active, so LVGL is never left
+    # on a deleted screen.
+    for _attr in ("fx_page", "kits_page"):
+        try:
+            pg = getattr(screen, _attr, None)
+            if pg is not None and getattr(pg, "screen", None) is not None:
+                try:
+                    lv.screen_load(screen.screen)
+                except Exception:
+                    pass
+                try:
+                    pg.screen.delete()
+                except Exception:
+                    pass
+                pg.screen = None
+        except Exception:
+            pass
 
 
 def run(screen):
@@ -3751,6 +4169,9 @@ def run(screen):
         for k in BUS_FX_DEFAULTS:
             f[k] = BUS_FX_DEFAULTS[k]
         app.bus_fx.append(f)
+    # per-project sample overrides from the KITS page: {kit_idx: {role: preset}}
+    app.kit_overrides = {}
+    app.kits_page = None
     app.user_projects = load_user_projects()
 
     app.rows = []
@@ -3781,6 +4202,7 @@ def run(screen):
     app.save_popup = SaveProjectPopup(app.group)
     app.kit_popup = KitPopup(app.group)
     app.fx_page = FXPage(app.group)
+    app.kits_page = KitsPage(app.group)
 
     app.bank_row.refresh_cv()
     if CV_AUTOSTART:
