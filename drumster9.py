@@ -58,6 +58,17 @@ import amy
 import sequencer
 import random
 
+# Build marker. Printed by run(), and shown in the info line, so you can
+# confirm which copy of this file the Tulip is ACTUALLY executing.
+# MicroPython caches imported modules in sys.modules, so overwriting the
+# .py and calling run() again can silently re-run the previously loaded
+# version. If the build shown at startup isn't the one you just
+# transferred, the old module is still cached - clear it with:
+#     import sys; sys.modules.pop('drumster9', None)
+#     run('drumster9.py')
+# or just reboot the Tulip and run it again.
+APP_BUILD = "2026-09-16 fx-screen-visible"
+
 try:
     import ujson as json
 except ImportError:
@@ -2241,6 +2252,15 @@ class FXPage:
         # paused - audio keeps running, only the visuals pause.
         app.ui_paused = True
         self.refresh()
+        # Belt-and-braces: force the page visible before loading its screen.
+        # The page is shown/hidden by swapping screens, never by a HIDDEN
+        # flag, so if anything ever leaves one set here we'd render a black
+        # screen with no reachable Close button. Clearing it is free.
+        try:
+            self.fxgroup.remove_flag(lv.obj.FLAG.HIDDEN)
+            self.panel.remove_flag(lv.obj.FLAG.HIDDEN)
+        except Exception:
+            pass
         try:
             lv.screen_load(self.screen)
         except Exception as ex:
@@ -2469,6 +2489,11 @@ class KitsPage:
         self.close_picker()
         self.refresh()
         app.ui_paused = True
+        try:                            # same guard as the FX page
+            self.kgroup.remove_flag(lv.obj.FLAG.HIDDEN)
+            self.panel.remove_flag(lv.obj.FLAG.HIDDEN)
+        except Exception:
+            pass
         try:
             lv.screen_load(self.screen)
         except Exception as ex:
@@ -4220,3 +4245,8 @@ def run(screen):
     _update_play_btn()
     app.bank_row.refresh()
     app.present()
+    # Say which build this is, so a cached/stale module is obvious at a
+    # glance (see APP_BUILD at the top of this file).
+    print("drumster9 build:", APP_BUILD)
+    if app.header2 is not None:
+        app.header2.set_info("build " + APP_BUILD)
