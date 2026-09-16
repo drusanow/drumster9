@@ -608,15 +608,33 @@ def configure_lane(lane):
     apply_lane_route(lane)
 
 
-def lane_amp(lane):
-    """This lane's oscillator gain: bus drive x lane volume.
+def _gate_open(lane):
+    """Whether this lane should be making sound right now: it has a sample
+    for its role on the current kit, the transport is running, and it is
+    neither muted nor soloed-out."""
+    return (lane.has_sample() and app is not None and app.playing
+            and lane.audible())
 
-    Both the FX "drive" knob and the per-lane volume live on the SAME
-    place - the oscillator's `amp` const coefficient, which AMY treats as
-    the oscillator's overall gain (1.0 = full, 0.0 = silent, values > 1
-    add gain). Folding them together here means a volume change is a
-    single amy.send(osc, amp=...) with no sequence rebuild, and a drive
-    change stays consistent with whatever volume the lane is at."""
+
+def lane_amp(lane):
+    """This lane's oscillator gain, and its on/off gate, in one number.
+
+    Everything that decides how loud (or whether) a lane sounds lives on
+    the SAME place - the oscillator's `amp` const coefficient, which AMY
+    treats as the oscillator's overall gain (1.0 = full, 0.0 silences the
+    oscillator entirely, values > 1 add gain):
+
+        - FX "drive" and per-lane volume set the level (drive x vol);
+        - mute / solo / transport-stopped / no-sample close the gate (0).
+
+    Because all of it is one amp message per lane, NONE of these settings
+    has to rebuild the AMY sequence any more - changing volume, muting,
+    soloing, starting/stopping, or switching kits is a handful of
+    osc-level messages that never touch the events AMY is sequencing. The
+    events themselves fire at a fixed full velocity (see out_vel); this
+    number is what actually gates and scales them."""
+    if not _gate_open(lane):
+        return 0.0
     f = app.bus_fx[lane.bus]
     return f["drive"] * lane.vol
 
@@ -665,11 +683,31 @@ def configure_all_lanes():
         configure_lane(r)
 
 
+def _fx_num(x):
+    """Format a float for an AMY wire string WITHOUT scientific notation.
+
+    We build reverb/echo/eq as one pre-joined string and pass it straight
+    to amy.send, so amy.py's own float truncation never sees the individual
+    fields. Python's "%s" on a float renders tiny values in exponent form
+    (e.g. dialing a level down by 0.05 lands on 1.39e-17, not 0.0, and
+    prints "1.38...e-17"). AMY's C wire parser reads the mantissa and drops
+    the exponent, so that "0" arrived as ~1.4 - a reverb level way past
+    full, which is the distortion you heard when turning reverb down to 0.
+    Formatting like amy.py's own trunc() (fixed decimals, trailing zeros
+    stripped) keeps every value in plain decimal. Paired with the rounding
+    in fx_set, a knob at 0 now really sends "0"."""
+    try:
+        return ("%.6f" % float(x)).rstrip("0").rstrip(".") or "0"
+    except Exception:
+        return "0"
+
+
 def send_reverb(b):
     f = app.bus_fx[b]
     try:
         _amy_fx(bus=b, reverb="%s,%s,%s" % (
-            f["rev_level"], f["rev_liveness"], f["rev_damping"]))
+            _fx_num(f["rev_level"]), _fx_num(f["rev_liveness"]),
+            _fx_num(f["rev_damping"])))
     except Exception:
         pass
 
@@ -678,8 +716,8 @@ def send_echo(b):
     f = app.bus_fx[b]
     try:
         _amy_fx(bus=b, echo="%s,%s,%s,%s,%s" % (
-            f["echo_level"], int(f["echo_ms"]), 500,
-            f["echo_fb"], f["echo_tone"]))
+            _fx_num(f["echo_level"]), int(f["echo_ms"]), 500,
+            _fx_num(f["echo_fb"]), _fx_num(f["echo_tone"])))
     except Exception:
         pass
 
@@ -687,7 +725,8 @@ def send_echo(b):
 def send_eq(b):
     f = app.bus_fx[b]
     try:
-        _amy_fx(bus=b, eq="%s,%s,%s" % (f["eq_l"], f["eq_m"], f["eq_h"]))
+        _amy_fx(bus=b, eq="%s,%s,%s" % (
+            _fx_num(f["eq_l"]), _fx_num(f["eq_m"]), _fx_num(f["eq_h"])))
     except Exception:
         pass
 
@@ -811,7 +850,11 @@ def fx_set(key, delta, lo, hi, step, row=None):
     the encoder can't flood the sequencer (see _fx_queue above)."""
     b = app.fx_bus
     f = app.bus_fx[b]
-    f[key] = clampf(f[key] + delta * step, lo, hi)
+    # round to kill floating-point dust: repeatedly adding/subtracting a
+    # step like 0.05 drifts off exact values (e.g. it reaches 1.39e-17
+    # instead of 0.0), which would otherwise reach the wire in exponent
+    # form - see _fx_num for why that distorted the reverb at 0
+    f[key] = round(clampf(f[key] + delta * step, lo, hi), 6)
 
     _fx_queue(b, _FX_GROUP.get(key, "reverb"))
 
@@ -1408,8 +1451,10 @@ class Lane(UIElement):
             return
         self.kit_override = kit
         self.refresh_kit_btn()
-        configure_lane(self)  # re-point THIS lane's oscillator only
-        self.refresh_events() # vel may change if the new kit lacks this drum
+        # configure_lane re-points this lane's oscillator AND re-sends its
+        # amp (which is 0 when the new kit lacks a sample for this role, so
+        # the gate closes automatically). No event rebuild needed.
+        configure_lane(self)
 
     def set_bus(self, bus):
         bus = bus % NUM_BUSES
@@ -1428,20 +1473,14 @@ class Lane(UIElement):
         return True
 
     def out_vel(self):
-        """The note-on velocity this lane's events fire at right now, used
-        purely as an ON/OFF gate - loudness itself now lives on the
-        oscillator's amp (see lane_amp / set_vol), so this no longer
-        carries the volume and never changes when the volume knob moves.
-
-        Muted / soloed-out / transport-stopped / no sample for this role
-        on the current kit => MUTE_VEL (a near-zero velocity, effectively
-        silent - same as a GM kit simply lacking that drum). Otherwise a
-        full-scale note-on; the amp gain decides how loud that actually
-        is, and vol == 0 makes amp 0, which silences the oscillator."""
-        if (self.has_sample() and app is not None and app.playing
-                and self.audible()):
-            return 1.0
-        return MUTE_VEL
+        """The note-on velocity every one of this lane's events fires at:
+        a constant full-scale trigger. Loudness AND gating (volume, mute,
+        solo, transport, no-sample) all live on the oscillator's amp now
+        (see lane_amp), so the events never have to change - which is what
+        lets volume/mute/solo/transport/kit changes avoid a sequence
+        rebuild entirely. A closed gate is amp 0, which AMY renders as
+        silence, so the fixed 1.0 here is safe even for a muted lane."""
+        return 1.0
 
     # -- AMYSequence event bookkeeping (off the audio path) --
 
@@ -1548,13 +1587,15 @@ class Lane(UIElement):
     def mute_cb(self, e=None):
         self.muted = not self.muted
         self.mute_btn.set_color(C_MUTE_ON if self.muted else C_BTN)
-        refresh_all_events()      # audibility affects every lane via solo
+        # gate lives on amp now: one amp message per lane, no rebuild.
+        # (all lanes, because solo makes one lane's state affect the rest)
+        refresh_all_amps()
 
     def solo_cb(self, e=None):
         self.solo = not self.solo
         self.solo_btn.set_color(C_SOLO_ON if self.solo else C_BTN)
         update_solo_state()
-        refresh_all_events()
+        refresh_all_amps()
 
     def rnd_cb(self, e=None):
         self.set_steps(random_steps(self.name))
@@ -1567,7 +1608,11 @@ class Lane(UIElement):
         app.kit_popup.show(self.row_i)
 
     def set_vol(self, v):
-        self.vol = clampf(v, 0.0, 1.0)
+        # round for the same reason as fx_set: keep repeated +/-0.05 steps
+        # from drifting to values like 1e-17 that would reach the wire in
+        # exponent form (amy.py's trunc handles the amp float here, but
+        # rounding keeps the stored value, the % label and saved JSON clean)
+        self.vol = round(clampf(v, 0.0, 1.0), 6)
         # Volume is the oscillator's amp gain now, not the event velocity:
         # ONE amy.send to this lane's own oscillator, no sequence rebuild.
         # This is the change that keeps a volume drag from stuttering
@@ -1890,7 +1935,8 @@ class FXPage:
 
         title = lv.label(self.panel)
         title.set_text("FX  -  each bus has its own reverb, echo and EQ. "
-                        "Tap a lane below to move it onto this bus.")
+                        "Tap a lane to move it onto this bus; tap it again "
+                        "to send it back to bus 0.")
         title.align_to(self.panel, lv.ALIGN.LEFT_MID, 20, FXPage.Y_TITLE)
         Button(self.panel, "Close", 860, 110, 44, self.close, C_BTN,
                 FXPage.Y_TITLE)
@@ -1975,7 +2021,15 @@ class FXPage:
 
     def make_assign(self, lane_i):
         def _cb(e=None):
-            app.rows[lane_i].set_bus(app.fx_bus)
+            lane = app.rows[lane_i]
+            # Toggle: tap a lane to put it on the bus you're viewing; tap it
+            # again (while it's already here) to take it off and send it
+            # back to bus 0. On bus 0 itself there's nowhere to toggle back
+            # to, so a tap there just (re)assigns to 0.
+            if lane.bus == app.fx_bus and app.fx_bus != 0:
+                lane.set_bus(0)
+            else:
+                lane.set_bus(app.fx_bus)
             self.refresh()
         return _cb
 
@@ -2204,16 +2258,14 @@ class HeaderBottom(UIElement):
 
 def apply_kit(idx):
     """Change the global kit. Re-points only the lanes that follow it
-    (no per-lane override) - each is one short osc message to that
-    lane's own fixed oscillator, plus an event-velocity refresh in case
-    the new kit doesn't have a sample for that role. No reset, no
-    sequence rebuild."""
+    (no per-lane override) - each is a couple of short osc messages to
+    that lane's own fixed oscillator (new sample, route, and amp, the amp
+    gating the lane silent if the new kit lacks its drum). No reset, and
+    no sequence rebuild - the events are untouched."""
     app.kit_idx = idx % len(KITS)
-    with _seq_batch():           # one rebuild for all lanes that followed
-        for r in app.rows:
-            if r.kit_override is None:
-                configure_lane(r)
-                r.refresh_events()
+    for r in app.rows:
+        if r.kit_override is None:
+            configure_lane(r)
     if app.header is not None:
         app.header.set_kit(KITS[app.kit_idx][1])
 
@@ -2449,11 +2501,6 @@ def apply_project_snapshot(proj):
             s = entry.get("steps", [])
             r.set_steps(s if isinstance(s, list) else [])
         update_solo_state()
-        # configure_lane() above applied each lane's amp before its saved
-        # volume was restored, so push the amps once more now that vol is
-        # set (loudness lives on amp, not on the event velocity)
-        refresh_all_amps()
-        refresh_all_events()
     else:
         # older save format: a flat {"steps": {lane_name: [..]}} dict
         steps = proj.get("steps", {})
@@ -2481,6 +2528,10 @@ def apply_project_snapshot(proj):
     active_slot = app.bank_patterns[app.bank_active]
     if isinstance(active_slot, dict):
         apply_pattern_snapshot(active_slot)
+    # amp carries both level and gate now, so one pass here brings every
+    # lane's oscillator in line with the fully-loaded vol/mute/solo/kit
+    # state - all the audio update a project load needs, no event rebuild
+    refresh_all_amps()
     if app.bank_row is not None:
         app.bank_row.refresh()
 
@@ -2622,7 +2673,7 @@ def _save_transport_hold(on):
             activate_buses()
             configure_all_lanes()
             apply_all_fx()
-            refresh_all_events()
+            refresh_all_amps()    # gate/level ride on amp now, not events
         except Exception as ex:
             print("[save] full restart failed:", ex)
 
@@ -2983,7 +3034,9 @@ def toggle_play(e=None):
 def _apply_transport(playing):
     app.playing = playing
     app.pending_play = None
-    refresh_all_events()      # events fire at vol when playing, else MUTE_VEL
+    # start/stop is now a gate on amp (0 when stopped), not an event
+    # rewrite: one amp message per lane, no sequence rebuild at the bar edge
+    refresh_all_amps()
     if not playing:
         clear_leds()
     cv_transport(playing)     # the rack starts/stops with the app
