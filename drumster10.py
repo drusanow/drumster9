@@ -67,7 +67,7 @@ import random
 #     import sys; sys.modules.pop('drumster10', None)
 #     run('drumster10.py')
 # or just reboot the Tulip and run it again.
-APP_BUILD = "2026-09-16 fx-screen-visible"
+APP_BUILD = "2026-09-16 smooth-pattern-switch"
 
 try:
     import ujson as json
