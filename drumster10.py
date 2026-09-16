@@ -2110,9 +2110,8 @@ class FXPage:
         self.panel.remove_flag(lv.obj.FLAG.SCROLLABLE)
 
         title = lv.label(self.panel)
-        title.set_text("FX  -  each bus has its own reverb, echo and EQ. "
-                        "Tap a lane to move it onto this bus; tap it again "
-                        "to send it back to bus 0.")
+        title.set_text("Tap a lane to activate it on that BUS, "
+                        "tap it again to send it back to BUS 0")
         title.align_to(self.panel, lv.ALIGN.LEFT_MID, 20, FXPage.Y_TITLE)
         Button(self.panel, "Close", 860, 110, 44, self.close, C_BTN,
                 FXPage.Y_TITLE)
@@ -4245,8 +4244,6 @@ def run(screen):
     _update_play_btn()
     app.bank_row.refresh()
     app.present()
-    # Say which build this is, so a cached/stale module is obvious at a
-    # glance (see APP_BUILD at the top of this file).
+    # Say which build this is on the REPL only (not the info line, which
+    # is for live status), so a cached/stale module is still easy to spot.
     print("drumster10 build:", APP_BUILD)
-    if app.header2 is not None:
-        app.header2.set_info("build " + APP_BUILD)
