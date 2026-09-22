@@ -43,13 +43,28 @@
 #      amy.send() - and a lane-filter/drive change touches only the lanes
 #      on that bus, once, at the end of the burst.
 #
-#   4. _led_tick() (the choke + CV + LED clock) skips the choke scan while
-#      stopped, so it stays as short as possible on the hot path.
+#   4. The PRE-HIT CHOKE now lives in AMY's sequencer, not in Python.
+#      It used to be sent from _led_tick, which is a TulipSequence -
+#      tulip.seq_add_callback, i.e. the MicroPython scheduler, the very
+#      thing Tulip's author describes as lagging during screen redraws.
+#      A late tick meant a late note-off, which re-tripped the PCM
+#      retrigger bug the choke exists to hide: the hitch you heard when
+#      changing pages. The note-offs are now scheduled events sitting in
+#      app.seq beside the hits, fired by AMY's own high-priority thread.
+#      _led_tick therefore does NO audio work at all any more - only the
+#      eurorack clock and the playhead LED - so a stalled redraw cannot
+#      affect the drums. See the choke notes further down for why this
+#      stays inside AMY's event budget.
+#
+#   5. Bulk pattern loads defer the grid repaint off the sequencer tick
+#      (see _DeferCells), so switching pattern swaps the notes first and
+#      draws the hits in right behind.
 #
 # Nothing here adds threads or moves amy.send() off the MicroPython task:
 # the firmware already runs AMY rendering and the AMY sequencer on their
-# own high-priority FreeRTOS tasks, so the fix is to stop starving the
-# MicroPython task, not to add concurrency of our own.
+# own high-priority FreeRTOS tasks. The wins come from using AMY's
+# sequencer for everything the music depends on, and keeping Python for
+# what it is good for - the display.
 # =====================================================================
 
 from tulip import UIScreen, UIElement, pal_to_lv, lv_depad, lv
@@ -67,7 +82,7 @@ import random
 #     import sys; sys.modules.pop('drumster10', None)
 #     run('drumster10.py')
 # or just reboot the Tulip and run it again.
-APP_BUILD = "2026-09-16 smooth-pattern-switch"
+APP_BUILD = "2026-09-22 amy-sequenced-choke"
 
 try:
     import ujson as json
@@ -1184,6 +1199,7 @@ def drop_sequence():
             pass
     for r in app.rows:
         r.events = {}
+        r.choke_events = {}
 
 
 def refresh_all_events():
@@ -1244,12 +1260,11 @@ def _led_tick(x):
         # in small chunks (see the chunked writer) so nothing here has to
         # stand still. Transport, bank switches and the playhead all keep
         # their timing straight through a save.
-        # The pre-hit choke only matters while hits are actually sounding.
-        # When stopped, every event fires at MUTE_VEL (silent), so there is
-        # nothing to choke - skip the whole scan to keep this callback as
-        # short as possible on the hot path.
-        if app.playing:
-            _choke_next_step(step)
+        # NO AUDIO WORK HERE. The pre-hit choke used to fire from this
+        # callback; it is now scheduled in AMY's own sequencer alongside
+        # the hits (see the choke notes below), so nothing this callback
+        # does - or fails to do on time - can affect the drums. What is
+        # left is the eurorack clock and the playhead LED.
         _cv_tick(step)
         if app.playing and not app.ui_paused:
             app.led_row.light(step)
@@ -1290,19 +1305,34 @@ def _led_tick(x):
 # Skipped when this lane also plays on the CURRENT step, so drum rolls on
 # consecutive steps are never choked - and they don't need it anyway,
 # since a hit that close lands nowhere near the end of the sample.
-
-def _choke_next_step(step):
-    """Note-off any lane that is about to be retriggered on the next step."""
-    nxt = (step + 1) % NUM_STEPS
-    for r in app.rows:
-        if nxt not in r.step_set or step in r.step_set:
-            continue
-        if not r.has_sample() or not r.audible():
-            continue
-        try:
-            amy.send(osc=r._osc, vel=0)
-        except Exception:
-            pass
+#
+# WHERE THE CHOKE RUNS, AND WHY IT MOVED
+# ---------------------------------------------------------------------
+# It used to be sent from _led_tick, i.e. from a TulipSequence, which is
+# tulip.seq_add_callback -> mp_sched_schedule -> the MicroPython task.
+# That is the Python scheduler, and it is exactly what Tulip's author
+# describes as lagging during screen redraws. A late tick meant a late
+# note-off - landing after the hit it was supposed to clear - which
+# re-tripped the very PCM retrigger bug the choke exists to hide. That
+# was the audible hitch when changing pages.
+#
+# The note-offs are now scheduled events in AMY's own sequencer, added to
+# app.seq next to the hits (Lane.sync_choke_events). AMY fires them from
+# its own high-priority thread, sample-accurately, with no Python in the
+# loop - so a stalled redraw cannot make a hit disappear any more. AMY's
+# docs are explicit that any event can be scheduled this way, note-offs
+# included, and that events sharing a tag accumulate.
+#
+# Two properties make this safe:
+#   - a choke step is by definition NOT a hit step for that lane, so a
+#     note-off and a note-on for the same oscillator can never land on
+#     the same tick;
+#   - chokes therefore fit in the steps hits don't use: hits + chokes
+#     <= NUM_STEPS per lane, so the whole grid stays inside AMY's
+#     max_sequencer_tags budget (7 * 32 = 224 of 256), the same ceiling
+#     as before.
+# The schedule depends on the step pattern alone, so mute/solo/volume
+# changes never touch it (a note-off on a silenced lane is harmless).
 
 
 def update_solo_state():
@@ -1651,6 +1681,7 @@ class Lane(UIElement):
         self.steps = []
         self.step_set = set()
         self.events = {}              # step -> AMYSequence event object
+        self.choke_events = {}        # step -> scheduled pre-hit note-off
 
         self.group.set_size(ROW_W, ROW_H)
         lv_depad(self.group)
@@ -1757,14 +1788,68 @@ class Lane(UIElement):
             except Exception:
                 pass
 
+    # -- pre-hit choke, as AMY-sequenced events (see the choke notes) --
+
+    def choke_steps(self):
+        """The steps at which this lane needs a note-off: the step BEFORE
+        each hit, but only where the lane isn't already playing on that
+        step (a hit that close never needs choking, and choking it would
+        cut a drum roll short).
+
+        This depends on the step pattern ONLY - not on mute/solo/volume -
+        so it never has to be recomputed when the mix changes. Note these
+        steps are by definition NOT hits, so hits + chokes can never
+        exceed NUM_STEPS per lane, keeping us inside AMY's event budget."""
+        ss = self.step_set
+        out = set()
+        for s in ss:
+            p = (s - 1) % NUM_STEPS
+            if p not in ss:
+                out.add(p)
+        return out
+
+    def sync_choke_events(self):
+        """Make the scheduled note-offs match choke_steps(), adding and
+        removing only what actually changed."""
+        if app.seq is None:
+            return
+        want = self.choke_steps()
+        for p in list(self.choke_events.keys()):
+            if p not in want:
+                e = self.choke_events.pop(p, None)
+                if e is not None:
+                    try:
+                        e.remove()
+                    except Exception:
+                        pass
+        for p in want:
+            if p in self.choke_events:
+                continue
+            try:
+                self.choke_events[p] = app.seq.add(p, amy.send, [],
+                                                    osc=self._osc, vel=0)
+            except Exception as ex:
+                print("choke add failed:", ex)
+
+    def _drop_choke_events(self):
+        for p in list(self.choke_events.keys()):
+            e = self.choke_events.pop(p, None)
+            if e is not None:
+                try:
+                    e.remove()
+                except Exception:
+                    pass
+
     def rebuild_events(self):
         """Drop and re-add all of this lane's events from the grid."""
         for step in list(self.events.keys()):
             self._remove_event(step)
+        self._drop_choke_events()
         if app.seq is None:
             return
         for step in self.step_set:
             self._add_event(step)
+        self.sync_choke_events()
 
     def refresh_events(self):
         """Re-send this lane's events at the current ON/OFF gate velocity
@@ -1813,10 +1898,12 @@ class Lane(UIElement):
             if c.on != want:
                 c.set_on(want)
 
-    def set_step(self, step, on):
+    def set_step(self, step, on, sync_choke=True):
         # The model + AMY event updates always happen now; painting the
         # cell is skipped while a bulk load is in progress and done once
         # afterwards, off the sequencer tick (see _DeferCells).
+        # `sync_choke=False` lets a bulk rewrite re-sync the scheduled
+        # note-offs once at the end instead of after every single step.
         if on and step not in self.step_set:
             self.step_set.add(step)
             self.steps = sorted(self.step_set)
@@ -1829,6 +1916,10 @@ class Lane(UIElement):
             if not _cells_deferred():
                 self.cells[step].set_on(False)
             self._remove_event(step)
+        else:
+            return                      # nothing changed
+        if sync_choke:
+            self.sync_choke_events()
 
     def toggle_step(self, step):
         self.set_step(step, step not in self.step_set)
@@ -1842,10 +1933,12 @@ class Lane(UIElement):
         with _seq_batch():
             for s in list(self.step_set):
                 if s not in want:
-                    self.set_step(s, False)
+                    self.set_step(s, False, sync_choke=False)
             for s in want:
                 if s not in self.step_set:
-                    self.set_step(s, True)
+                    self.set_step(s, True, sync_choke=False)
+            # one choke re-sync for the whole lane, not one per step
+            self.sync_choke_events()
         # note: callers that use set_steps for bulk loads (apply_preset,
         # apply_pattern_snapshot, _apply_bank) call _auto_save_slot()
         # themselves AFTER loading all lanes, not per-lane here, to
