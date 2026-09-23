@@ -111,7 +111,7 @@ except ImportError:
 #     import sys; sys.modules.pop('drumster9', None)
 #     run('drumster9.py')
 # or just reboot the Tulip and run it again.
-APP_BUILD = "2026-09-23 live-output-meter"
+APP_BUILD = "2026-09-23 meter-peak-hold"
 
 try:
     import ujson as json
@@ -561,13 +561,26 @@ MASTER_VOL_STEP = 0.5    # what one tap of master -/+ moves
 # raises NotImplementedError, and we fall back to drawing the level you
 # have SET on a gain scale instead (see MixPage._live).
 #
-# Honest limitation even when live: we poll one block every METER_MS
-# rather than seeing every block, so this is a SAMPLED peak, not a true
-# peak - a transient landing between polls is missed. At ~20Hz against
-# drum hits that ring for 100ms+ it catches what you want to see, but it
-# is not a certified peak meter.
-METER_MS = 50            # poll the output block at ~20Hz while MIX is open
-METER_RELEASE_DB = 2.5   # dB the needle falls per tick (fast up, slow down)
+# SAMPLING. AMY renders a block of AMY_BLOCK_SIZE frames (256) every
+# ~5.8ms at the ESP32's 44.1kHz, and get_output_buffer only ever hands
+# back the MOST RECENT one - so how much of the signal we see is decided
+# by how often we poll. At the original 50ms that was about one block in
+# nine, roughly 12% of the audio, and a drum transient only spans a block
+# or two: we missed the peak the vast majority of the time, and the meter
+# never reached the amber/red it should have. (The web build polls on a
+# finer timer, which is why it looked right there and not on hardware.)
+#
+# Tulip's defer fires on AMY sequencer ticks, so a tick is the fastest we
+# can go - ~10ms at 120bpm, a bit over half the blocks. Asking for less
+# than a tick simply lands on the next one, which is what we want.
+# Combined with the peak hold below, transients now register.
+#
+# Still not a true peak meter: between two polls a block can pass unseen.
+METER_MS = 5             # i.e. "as soon as the defer clock allows"
+METER_HOLD_MS = 600      # how long a caught peak stays up before falling
+METER_RELEASE_DB_S = 40.0  # fall rate in dB per SECOND once the hold expires
+METER_RELEASE_DB = 2.5   # per-poll fallback if no millisecond clock exists
+METER_REDRAW_DB = 0.5    # don't repaint LVGL for changes smaller than this
 
 # live (measured) scale, dBFS
 METER_MIN_DBFS = -60.0
@@ -1175,6 +1188,15 @@ def output_meter_supported():
         return False
 
 
+def _meter_now_ms():
+    """Millisecond clock for the meter's ballistics, 0 if unavailable (in
+    which case the meter falls back to a fixed drop per poll)."""
+    try:
+        return amy.ticks_ms()
+    except Exception:
+        return 0
+
+
 def output_peak_dbfs():
     """Peak level of AMY's most recent rendered audio block, in dBFS.
     None if nothing could be read this time round."""
@@ -1185,8 +1207,13 @@ def output_peak_dbfs():
     if not buf:
         return None
     try:
-        # int16 view, so max()/min() scan in C rather than a Python loop
-        a = array.array('h', buf)
+        # int16 view so max()/min() scan in C rather than a Python loop.
+        # memoryview.cast avoids copying the block; array.array is the
+        # fallback for builds whose memoryview has no cast().
+        try:
+            a = memoryview(buf).cast('h')
+        except Exception:
+            a = array.array('h', buf)
         if len(a) == 0:
             return None
         hi = max(a)
@@ -3187,6 +3214,9 @@ class MixPage:
             return
         self._meter_running = True
         self._meter_db = METER_MIN_DBFS
+        self._drawn_db = None
+        self._hold_until = 0
+        self._last_ms = _meter_now_ms()
         self._draw_meter(self._meter_db)     # start from the floor
         # defer_try, not defer_safe: this callback re-arms itself, and
         # defer_safe's "run it inline instead" fallback would recurse.
@@ -3201,12 +3231,31 @@ class MixPage:
             return
         db = output_peak_dbfs()
         if db is not None:
-            # fast attack, slow release, like a real meter's ballistics
-            if db > self._meter_db:
+            now = _meter_now_ms()
+            if db >= self._meter_db:
+                # instant attack, and HOLD it - we only see a fraction of
+                # the blocks, so a peak we do catch has to stay up long
+                # enough to be read rather than decaying before the next
+                # poll lands
                 self._meter_db = db
-            else:
+                self._hold_until = now + METER_HOLD_MS if now else 0
+            elif now == 0:
+                # no millisecond clock: fall a fixed amount per poll
                 self._meter_db = max(db, self._meter_db - METER_RELEASE_DB)
-            self._draw_meter(self._meter_db)
+            elif now >= self._hold_until:
+                dt = (now - self._last_ms) / 1000.0
+                if dt < 0 or dt > 1.0:
+                    dt = 0.0            # clock wrapped or we were away
+                self._meter_db = max(db,
+                                      self._meter_db - METER_RELEASE_DB_S * dt)
+            self._last_ms = now
+            # repaint only on a visible change; at tick rate this keeps
+            # LVGL work down to what the eye can actually see
+            if (self._drawn_db is None
+                    or abs(self._meter_db - self._drawn_db) >= METER_REDRAW_DB
+                    or self._meter_db <= METER_MIN_DBFS):
+                self._drawn_db = self._meter_db
+                self._draw_meter(self._meter_db)
         if self._meter_running:
             if not defer_try(self._meter_tick, None, METER_MS):
                 self._meter_running = False
