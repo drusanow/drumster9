@@ -73,6 +73,12 @@
 #      or bank bookkeeping, so a pattern switch can't push the eurorack
 #      clock edge late.
 #
+#   8. UI: lane labels shortened (K/SN/CL/CH/OH/CY/TM - display only, the
+#      role names behind them are unchanged and still key the kits and
+#      every saved file), M/S/R and the kit button widened, the per-lane
+#      volume button replaced by a MIX page with all seven faders, a
+#      readout each and a master out.
+#
 # Nothing here adds threads or moves amy.send() off the MicroPython task:
 # the firmware already runs AMY rendering and the AMY sequencer on their
 # own high-priority FreeRTOS tasks. The wins come from using AMY's
@@ -95,7 +101,7 @@ import random
 #     import sys; sys.modules.pop('drumster10', None)
 #     run('drumster10.py')
 # or just reboot the Tulip and run it again.
-APP_BUILD = "2026-09-23 no-click-choke-cv-first"
+APP_BUILD = "2026-09-23 mix-page-ui"
 
 try:
     import ujson as json
@@ -440,6 +446,20 @@ ELEMENTS = [
     ("Tom",    45, 0.50),
 ]
 
+# Short labels for the sequencer's lane strip, where space is tight.
+# DISPLAY ONLY - the role name in ELEMENTS stays the identity of a lane:
+# it is the key into every kit's sample map, into the KITS page's
+# per-project overrides, and into every saved project and pattern on
+# disk. Renaming a role would silently orphan all of that.
+SHORT_NAMES = {
+    "Kick": "K", "Snare": "SN", "Clap": "CL", "CHat": "CH",
+    "OHat": "OH", "Cymbal": "CY", "Tom": "TM",
+}
+
+
+def short_name(role):
+    return SHORT_NAMES.get(role, role[:2].upper())
+
 RANDOM_RANGES = {
     "Kick": (3, 6), "Snare": (1, 3), "Clap": (0, 3), "CHat": (4, 10),
     "OHat": (0, 4), "Cymbal": (0, 2), "Tom": (0, 4),
@@ -517,6 +537,9 @@ BUS_FX_DEFAULTS = {
 # harsh/distorted, that's clipping and this is the number to bring back
 # down.
 BUS_VOLUME = 15.0        # per-bus mixdown level into the final output
+                         # (the STARTUP default for the MIX page's master)
+MAX_MASTER_VOL = 30.0    # top of the MIX page's master fader
+MASTER_VOL_STEP = 0.5    # what one tap of master -/+ moves
 
 
 # --- layout (1024 x 600) ----------------------------------------------
@@ -528,18 +551,21 @@ STEP_W = 24
 STEP_RECT_W = 21
 STEP_H = 40
 BUS_ROW_H = 56
-LANE_BTN_H = 38
-BTN_D = 28
+LANE_BTN_H = 42         # taller lane buttons = bigger touch target
+BTN_D = 40              # M / S / R width (was 28 - widened for touch)
+KIT_BTN_W = 56          # per-lane kit button
 LED_ROW_H = 22          # row of 32 position LEDs above the grid
 LED_W = 21              # each LED, aligned under its step column
 LED_H = 12
 
+# The lane control strip, 0..X_STEPS. The per-lane volume button used to
+# live here; it moved to the MIX page, and the space it freed (plus the
+# shorter lane labels below) went into making M / S / R / kit bigger.
 X_LABEL = 0
-X_MUTE = 56
-X_SOLO = 88
+X_MUTE = 32
+X_SOLO = 76
 X_RND = 120
-X_VOL = 152
-X_KIT = 184
+X_KIT = 164
 X_STEPS = 224
 ROW_W = X_STEPS + NUM_STEPS * STEP_W + 8
 
@@ -1034,15 +1060,41 @@ def activate_buses():
     smear was always present even with reverb and echo at zero. We don't
     offer chorus, so force its level to 0 on every bus. `chorus` is
     'level,delay,freq,depth'; level 0 = off."""
+    vol = master_vol()
     for b in range(NUM_BUSES):
         try:
-            _amy_fx(bus=b, volume=BUS_VOLUME)
+            _amy_fx(bus=b, volume=vol)
         except Exception as ex:
             print("bus volume set failed:", ex)
         try:
             _amy_fx(bus=b, chorus="0,320,0.5,0.5")   # kill default chorus
         except Exception:
             pass
+
+
+def master_vol():
+    """The master output level. BUS_VOLUME is the startup default; the MIX
+    page moves app.master_vol from there and it saves with the project."""
+    try:
+        v = app.master_vol
+    except Exception:
+        return BUS_VOLUME
+    if v is None:
+        return BUS_VOLUME
+    return v
+
+
+def set_master_vol(v):
+    """Set the master out. One `volume` message per bus - four messages,
+    no oscillator or sequence work at all."""
+    v = round(clampf(v, 0.0, MAX_MASTER_VOL), 6)
+    app.master_vol = v
+    for b in range(NUM_BUSES):
+        try:
+            _amy_fx(bus=b, volume=v)
+        except Exception:
+            pass
+    return v
 
 
 # Which effect each FX parameter belongs to, so changing one knob sends
@@ -1804,8 +1856,10 @@ class Lane(UIElement):
         self.group.remove_flag(lv.obj.FLAG.SCROLLABLE)
         strut(self.group, ROW_H)
 
+        # short label (K, SN, CL, ...) - the full role name lives in
+        # self.name and is what everything else keys off
         self.label = lv.label(self.group)
-        self.label.set_text(name)
+        self.label.set_text(short_name(name))
         self.label.align_to(self.group, lv.ALIGN.LEFT_MID, X_LABEL, 0)
 
         self.mute_btn = Button(self.group, "M", X_MUTE, BTN_D, LANE_BTN_H,
@@ -1814,9 +1868,8 @@ class Lane(UIElement):
                                 self.solo_cb)
         self.rnd_btn = Button(self.group, "R", X_RND, BTN_D, LANE_BTN_H,
                                self.rnd_cb)
-        self.vol_btn = Button(self.group, "V", X_VOL, BTN_D, LANE_BTN_H,
-                               self.vol_cb)
-        self.kit_btn = Button(self.group, "-", X_KIT, 34, LANE_BTN_H,
+        # no per-lane volume button any more - volume lives on the MIX page
+        self.kit_btn = Button(self.group, "-", X_KIT, KIT_BTN_W, LANE_BTN_H,
                                self.kit_cb, C_KIT_BTN)
 
         self.cells = []
@@ -2111,9 +2164,6 @@ class Lane(UIElement):
         self.set_steps(random_steps(self.name))
         _auto_save_slot()
 
-    def vol_cb(self, e=None):
-        app.vol_popup.show(self.row_i)
-
     def kit_cb(self, e=None):
         app.kit_popup.show(self.row_i)
 
@@ -2132,89 +2182,6 @@ class Lane(UIElement):
         except Exception:
             pass
 
-
-
-# --- volume popup ------------------------------------------------------
-
-class VolPopup:
-    def __init__(self, parent):
-        self.lane_i = None
-        self.panel = lv.obj(parent)
-        self.panel.set_size(430, 120)
-        self.panel.set_style_bg_color(lv_color(C_PANEL), 0)
-        self.panel.set_style_radius(8, 0)
-        self.panel.align_to(parent, lv.ALIGN.CENTER, 0, 0)
-        self.panel.remove_flag(lv.obj.FLAG.SCROLLABLE)
-
-        self.title = lv.label(self.panel)
-        self.title.set_text("Volume")
-        self.title.align_to(self.panel, lv.ALIGN.LEFT_MID, 16, -36)
-        Button(self.panel, "Close", 330, 84, 32, self.close, C_BTN, -36)
-
-        self.down = Button(self.panel, "-", 16, 44, 40, self.dec, C_BTN, 14)
-        self.slider = lv.slider(self.panel)
-        self.slider.set_size(200, 20)
-        self.slider.align_to(self.panel, lv.ALIGN.LEFT_MID, 72, 14)
-        self.slider.add_event_cb(self.slider_cb, lv.EVENT.VALUE_CHANGED, None)
-        self.up = Button(self.panel, "+", 288, 44, 40, self.inc, C_BTN, 14)
-        self.value = lv.label(self.panel)
-        self.value.set_text("0%")
-        self.value.align_to(self.panel, lv.ALIGN.LEFT_MID, 348, 14)
-        self.hide()
-
-    def _lane(self):
-        if self.lane_i is None:
-            return None
-        return app.rows[self.lane_i]
-
-    def _refresh(self, move_slider=True):
-        lane = self._lane()
-        if lane is None:
-            return
-        pct = int(lane.vol * 100 + 0.5)
-        self.title.set_text(lane.name + " volume")
-        self.value.set_text(str(pct) + "%")
-        if move_slider:
-            try:
-                self.slider.set_value(pct, 0)
-            except Exception:
-                pass
-
-    def slider_cb(self, e=None):
-        lane = self._lane()
-        if lane is None:
-            return
-        try:
-            v = e.get_target_obj().get_value()
-        except Exception:
-            v = self.slider.get_value()
-        lane.set_vol(v / 100.0)
-        self._refresh(move_slider=False)   # don't fight the finger
-
-    def dec(self, e=None):
-        lane = self._lane()
-        if lane:
-            lane.set_vol(lane.vol - VOL_STEP)
-            self._refresh()
-
-    def inc(self, e=None):
-        lane = self._lane()
-        if lane:
-            lane.set_vol(lane.vol + VOL_STEP)
-            self._refresh()
-
-    def close(self, e=None):
-        self.hide()
-
-    def show(self, lane_i):
-        self.lane_i = lane_i
-        self._refresh()
-        self.panel.remove_flag(lv.obj.FLAG.HIDDEN)
-        self.panel.move_foreground()
-
-    def hide(self):
-        self.lane_i = None
-        self.panel.add_flag(lv.obj.FLAG.HIDDEN)
 
 
 # --- save-as popup (name entry via Tulip's touch keyboard) -------------
@@ -2848,6 +2815,181 @@ def open_kits(e=None):
     app.kits_page.show()
 
 
+# --- MIX page: every lane's level, plus the master out -----------------
+#
+# One page with all seven drum levels side by side, so you can balance the
+# kit without hunting through per-lane popups. Each lane gets a slider you
+# can drag, a -/+ pair for fine steps, and a % readout, so you can see at a
+# glance where everything is sitting. The master row at the bottom is the
+# overall output level (AMY's per-bus `volume`, applied to all four buses).
+#
+# Like the FX and KITS pages this lives on its own LVGL screen, so opening
+# and closing it is a single screen_load and never disturbs playback. Every
+# move here is cheap by design: a lane level is one amp message to that
+# lane's oscillator (see Lane.set_vol) and the master is one volume
+# message per bus - no sequence work, so you can ride a fader while the
+# pattern plays.
+
+class MixPage:
+    _Y_FIRST = -150
+    _Y_STEP = 44
+
+    def __init__(self, parent):
+        self.screen = lv.obj()
+        self.mgroup = lv.obj(self.screen)
+        try:
+            gw, gh = tulip.screen_size()
+        except Exception:
+            gw, gh = 1024, 600
+        self.mgroup.set_width(gw)
+        self.mgroup.set_height(gh)
+        self.mgroup.set_style_radius(0, 0)
+        self.mgroup.set_style_border_width(0, 0)
+        self.mgroup.set_style_bg_color(lv_color(0), 0)
+        self.mgroup.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.mgroup)
+
+        self.panel = lv.obj(self.mgroup)
+        self.panel.set_size(1000, 470)
+        self.panel.set_style_bg_color(lv_color(C_PANEL), 0)
+        self.panel.set_style_radius(8, 0)
+        self.panel.align_to(self.mgroup, lv.ALIGN.CENTER, 0, 0)
+        self.panel.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        lv_depad(self.panel)
+
+        title = lv.label(self.panel)
+        title.set_text("MIX  -  drag a fader to set that drum's level. "
+                        "MASTER is the overall output.")
+        title.align_to(self.panel, lv.ALIGN.LEFT_MID, 20, -205)
+        Button(self.panel, "Close", 880, 90, 44, self.close, C_BTN, -205)
+
+        # one row per lane: name, -, fader, +, percent
+        self.rows = []
+        for i, (role, _note, _vol) in enumerate(ELEMENTS):
+            y = MixPage._Y_FIRST + i * MixPage._Y_STEP
+            lab = lv.label(self.panel)
+            lab.set_text(role)
+            lab.align_to(self.panel, lv.ALIGN.LEFT_MID, 24, y)
+            Button(self.panel, "-", 120, 46, 36, self._make_step(i, -1),
+                    C_BTN, y)
+            sl = lv.slider(self.panel)
+            sl.set_size(560, 18)
+            sl.align_to(self.panel, lv.ALIGN.LEFT_MID, 180, y)
+            sl.add_event_cb(self._make_slide(i), lv.EVENT.VALUE_CHANGED, None)
+            Button(self.panel, "+", 754, 46, 36, self._make_step(i, 1),
+                    C_BTN, y)
+            val = lv.label(self.panel)
+            val.set_text("")
+            val.align_to(self.panel, lv.ALIGN.LEFT_MID, 812, y)
+            self.rows.append((sl, val))
+
+        # master out
+        ym = MixPage._Y_FIRST + len(ELEMENTS) * MixPage._Y_STEP + 12
+        mlab = lv.label(self.panel)
+        mlab.set_text("MASTER")
+        mlab.align_to(self.panel, lv.ALIGN.LEFT_MID, 24, ym)
+        Button(self.panel, "-", 120, 46, 36, self.master_down, C_KIT_ON, ym)
+        self.master_slider = lv.slider(self.panel)
+        self.master_slider.set_size(560, 18)
+        self.master_slider.align_to(self.panel, lv.ALIGN.LEFT_MID, 180, ym)
+        self.master_slider.add_event_cb(self._master_slide,
+                                         lv.EVENT.VALUE_CHANGED, None)
+        Button(self.panel, "+", 754, 46, 36, self.master_up, C_KIT_ON, ym)
+        self.master_value = lv.label(self.panel)
+        self.master_value.set_text("")
+        self.master_value.align_to(self.panel, lv.ALIGN.LEFT_MID, 812, ym)
+
+    # -- lane faders --
+    def _make_slide(self, i):
+        def _cb(e=None):
+            try:
+                v = e.get_target_obj().get_value()
+            except Exception:
+                v = self.rows[i][0].get_value()
+            app.rows[i].set_vol(v / 100.0)
+            self._refresh_row(i, move_slider=False)   # don't fight the finger
+        return _cb
+
+    def _make_step(self, i, direction):
+        def _cb(e=None):
+            lane = app.rows[i]
+            lane.set_vol(lane.vol + direction * VOL_STEP)
+            self._refresh_row(i)
+        return _cb
+
+    def _refresh_row(self, i, move_slider=True):
+        try:
+            lane = app.rows[i]
+            sl, val = self.rows[i]
+            pct = int(lane.vol * 100 + 0.5)
+            val.set_text("%d%%" % pct)
+            if move_slider:
+                sl.set_value(pct, 0)
+        except Exception:
+            pass
+
+    # -- master --
+    def _master_slide(self, e=None):
+        try:
+            v = e.get_target_obj().get_value()
+        except Exception:
+            v = self.master_slider.get_value()
+        set_master_vol(v / 100.0 * MAX_MASTER_VOL)
+        self._refresh_master(move_slider=False)
+
+    def master_down(self, e=None):
+        set_master_vol(master_vol() - MASTER_VOL_STEP)
+        self._refresh_master()
+
+    def master_up(self, e=None):
+        set_master_vol(master_vol() + MASTER_VOL_STEP)
+        self._refresh_master()
+
+    def _refresh_master(self, move_slider=True):
+        try:
+            v = master_vol()
+            self.master_value.set_text("%.1f" % v)
+            if move_slider:
+                pct = int(v / MAX_MASTER_VOL * 100 + 0.5)
+                self.master_slider.set_value(clampf(pct, 0, 100), 0)
+        except Exception:
+            pass
+
+    def refresh(self):
+        for i in range(len(self.rows)):
+            self._refresh_row(i)
+        self._refresh_master()
+
+    # -- page show/hide (own screen) --
+    def show(self):
+        self.refresh()
+        app.ui_paused = True
+        try:                            # same guard as the other pages
+            self.mgroup.remove_flag(lv.obj.FLAG.HIDDEN)
+            self.panel.remove_flag(lv.obj.FLAG.HIDDEN)
+        except Exception:
+            pass
+        try:
+            lv.screen_load(self.screen)
+        except Exception as ex:
+            print("mix show failed:", ex)
+
+    def close(self, e=None):
+        self.hide()
+
+    def hide(self):
+        try:
+            lv.screen_load(app.screen)
+        except Exception as ex:
+            print("mix hide failed:", ex)
+        clear_leds()
+        app.ui_paused = False
+
+
+def open_mix(e=None):
+    app.mix_page.show()
+
+
 # --- pattern bank strip --------------------------------------------------
 
 class PatternBankRow(UIElement):
@@ -2867,13 +3009,13 @@ class PatternBankRow(UIElement):
         label.set_text("BANK")
         label.align_to(self.group, lv.ALIGN.LEFT_MID, X_LABEL, 0)
 
-        # Widened from 42/36 to 54/48 - these are the buttons you tap
-        # mid-performance, so they get the space freed up by shrinking
-        # the CV indicator and sliding COPY/PASTE right. Slots run
-        # 78..612, COPY starts at 630.
+        # These are the buttons you tap mid-performance, so they get the
+        # most touch space: widened again to 58 wide on a 64 pitch, paid
+        # for by narrowing COPY/PASTE (which you press far less often).
+        # Slots run 70..704.
         self.slot_btns = []
-        start = 78
-        pitch = 54
+        start = 70
+        pitch = 64
         for i in range(NUM_BANKS):
             btn = Button(self.group, BANK_LETTERS[i], start + i * pitch,
                           pitch - 6, HDR_BTN_H, self.make_select(i),
@@ -2881,9 +3023,9 @@ class PatternBankRow(UIElement):
             self.slot_btns.append(btn)
 
         # COPY and PASTE only - no SAVE, slots auto-update on every edit
-        self.copy_btn = Button(self.group, "COPY", 630, 136,
+        self.copy_btn = Button(self.group, "COPY", 716, 92,
                                  HDR_BTN_H, bank_copy, C_BTN)
-        self.paste_btn = Button(self.group, "PASTE", 778, 136,
+        self.paste_btn = Button(self.group, "PASTE", 814, 92,
                                   HDR_BTN_H, bank_paste, C_BTN)
         # CV clock out to eurorack. Half width - it is really just an
         # indicator (green = clocking) that happens to be tappable.
@@ -2950,11 +3092,11 @@ class HeaderTop(UIElement):
         Button(self.group, "+", 724, 44, HDR_BTN_H, bpm_up,
                 repeat_cb=bpm_up_fast)
 
-        Button(self.group, "FX", 770, 60, HDR_BTN_H, open_fx,
-                rgb332(150, 90, 200))
-        Button(self.group, "KITS", 836, 66, HDR_BTN_H, open_kits,
-                rgb332(150, 90, 200))
-        self.restart_btn = Button(self.group, "RESTART", 908, 92,
+        # SYNC moved up here, next to the tempo it belongs with, and
+        # narrowed; FX / KITS / MIX moved down to the second row
+        self.sync_btn = Button(self.group, "SYNC INT", 776, 100,
+                                HDR_BTN_H, toggle_midi_sync)
+        self.restart_btn = Button(self.group, "RESTART", 886, 114,
                                    HDR_BTN_H, restart_audio, C_RESTART)
 
     def set_pattern(self, t):
@@ -2978,22 +3120,28 @@ class HeaderBottom(UIElement):
         self.group.remove_flag(lv.obj.FLAG.SCROLLABLE)
         strut(self.group, HDR_H)
 
-        Button(self.group, "SAVE", 0, 96, HDR_BTN_H, open_save_popup)
-        self.update_btn = Button(self.group, "UPDATE", 106, 96, HDR_BTN_H,
+        # SAVE/UPDATE/LOAD/CLEAR trimmed a little to make room for the
+        # three page buttons that moved down from the top row, while
+        # leaving the info line its space on the far right.
+        Button(self.group, "SAVE", 0, 84, HDR_BTN_H, open_save_popup)
+        self.update_btn = Button(self.group, "UPDATE", 92, 88, HDR_BTN_H,
                                   self._on_update)
-        Button(self.group, "<", 216, 44, HDR_BTN_H, project_prev)
+        Button(self.group, "<", 190, 44, HDR_BTN_H, project_prev)
         self.project_label = lv.label(self.group)
         self.project_label.set_text("-- no project --")
-        self.project_label.align_to(self.group, lv.ALIGN.LEFT_MID, 264, 0)
-        Button(self.group, ">", 386, 44, HDR_BTN_H, project_next)
-        Button(self.group, "LOAD", 436, 96, HDR_BTN_H, project_load)
-        Button(self.group, "CLEAR", 546, 100, HDR_BTN_H, clear_all)
-        self.sync_btn = Button(self.group, "SYNC INT", 666, 130,
-                                HDR_BTN_H, toggle_midi_sync)
+        self.project_label.align_to(self.group, lv.ALIGN.LEFT_MID, 240, 0)
+        Button(self.group, ">", 360, 44, HDR_BTN_H, project_next)
+        Button(self.group, "LOAD", 412, 88, HDR_BTN_H, project_load)
+        Button(self.group, "CLEAR", 508, 92, HDR_BTN_H, clear_all)
+
+        _page = rgb332(150, 90, 200)
+        Button(self.group, "FX", 612, 58, HDR_BTN_H, open_fx, _page)
+        Button(self.group, "KITS", 676, 66, HDR_BTN_H, open_kits, _page)
+        Button(self.group, "MIX", 748, 62, HDR_BTN_H, open_mix, _page)
 
         self.info = lv.label(self.group)
         self.info.set_text("")
-        self.info.align_to(self.group, lv.ALIGN.LEFT_MID, 812, 0)
+        self.info.align_to(self.group, lv.ALIGN.LEFT_MID, 822, 0)
 
     def set_project(self, t):
         self.project_label.set_text(t)
@@ -3205,6 +3353,7 @@ def snapshot_project():
         "bank": [_deep_copy_pattern(p) for p in app.bank_patterns],
         "bank_active": app.bank_active,
         # KITS-page sample overrides; JSON keys must be strings
+        "master_vol": master_vol(),
         "kit_overrides": {str(k): dict(v)
                           for k, v in app.kit_overrides.items()},
     }
@@ -3221,6 +3370,11 @@ def apply_project_snapshot(proj):
     # KITS-page sample overrides FIRST, so the configure_lane calls that
     # follow (via apply_kit and the per-lane loop) pick up the right
     # samples. Defensive: ignore anything malformed field by field.
+    # master output level (older saves won't have one - keep the current)
+    mv = proj.get("master_vol", None)
+    if isinstance(mv, (int, float)) and mv >= 0:
+        set_master_vol(mv)
+
     app.kit_overrides = {}
     ko = proj.get("kit_overrides", None)
     if isinstance(ko, dict):
@@ -3799,11 +3953,10 @@ def set_midi_sync(on):
             sequencer.tempo(app.bpm)
         except Exception:
             pass
-    if app.header2 is not None:
-        app.header2.sync_btn.set_text("SYNC EXT" if app.midi_sync
-                                       else "SYNC INT")
-        app.header2.sync_btn.set_color(C_KIT_ON if app.midi_sync else C_BTN)
-    if app.header is not None:
+    if app.header is not None:          # SYNC lives on the top row now
+        app.header.sync_btn.set_text("SYNC EXT" if app.midi_sync
+                                      else "SYNC INT")
+        app.header.sync_btn.set_color(C_KIT_ON if app.midi_sync else C_BTN)
         app.header.set_bpm(app.bpm)
 
 
@@ -4473,7 +4626,7 @@ def quit(screen):
     # delete them so a re-run doesn't leak one each time. Load the app's
     # screen first in case one of them was active, so LVGL is never left
     # on a deleted screen.
-    for _attr in ("fx_page", "kits_page"):
+    for _attr in ("fx_page", "kits_page", "mix_page"):
         try:
             pg = getattr(screen, _attr, None)
             if pg is not None and getattr(pg, "screen", None) is not None:
@@ -4547,6 +4700,9 @@ def run(screen):
     # per-project sample overrides from the KITS page: {kit_idx: {role: preset}}
     app.kit_overrides = {}
     app.kits_page = None
+    app.mix_page = None
+    # master output level; the MIX page moves it, saved with the project
+    app.master_vol = BUS_VOLUME
     app.user_projects = load_user_projects()
 
     app.rows = []
@@ -4573,11 +4729,11 @@ def run(screen):
     app.bank_row = PatternBankRow()
     app.add(app.bank_row, direction=lv.ALIGN.OUT_BOTTOM_LEFT)
 
-    app.vol_popup = VolPopup(app.group)
     app.save_popup = SaveProjectPopup(app.group)
     app.kit_popup = KitPopup(app.group)
     app.fx_page = FXPage(app.group)
     app.kits_page = KitsPage(app.group)
+    app.mix_page = MixPage(app.group)
 
     app.bank_row.refresh_cv()
     if CV_AUTOSTART:
