@@ -60,6 +60,19 @@
 #      (see _DeferCells), so switching pattern swaps the notes first and
 #      draws the hits in right behind.
 #
+#   6. The choke is now only applied WHERE IT IS NEEDED. A PCM note-off
+#      hard-stops the sample with no release ramp, so choking a long
+#      sample mid-swing leaves an amplitude step - the click heard on
+#      TR-808/TR-909 kicks when hits were close together. AMY already
+#      restarts a still-sounding sample at its next zero crossing, which
+#      is click-free, so the choke is now limited to the narrow case its
+#      bug actually needs: a hit landing just as the previous sample runs
+#      out (see Lane.choke_steps and CHOKE_WINDOW_MS).
+#
+#   7. The CV clock is emitted FIRST in _led_tick, before any transport
+#      or bank bookkeeping, so a pattern switch can't push the eurorack
+#      clock edge late.
+#
 # Nothing here adds threads or moves amy.send() off the MicroPython task:
 # the firmware already runs AMY rendering and the AMY sequencer on their
 # own high-priority FreeRTOS tasks. The wins come from using AMY's
@@ -82,7 +95,7 @@ import random
 #     import sys; sys.modules.pop('drumster9', None)
 #     run('drumster9.py')
 # or just reboot the Tulip and run it again.
-APP_BUILD = "2026-09-22 amy-sequenced-choke"
+APP_BUILD = "2026-09-23 no-click-choke-cv-first"
 
 try:
     import ujson as json
@@ -335,6 +348,60 @@ KIT_BANK_KEY = [PCM_BANKS[i][0] for i in range(len(SAMPLE_KITS))]
 UTILITY_BANK_KEYS = ("acoustic", "extras")
 
 
+# How long each sample actually is, in milliseconds, from the same AMY
+# manifest as the names. Used ONLY to decide whether a hit needs the
+# pre-hit choke (see Lane.choke_steps): the AMY retrigger bug the choke
+# works around can only bite when a hit lands right as the previous
+# sample is running out, so we need to know how long the sample runs.
+PCM_MS = {}
+for _start, _ms in (
+        (0, (
+            3122, 1241, 818, 146, 47, 151, 308, 181, 345, 100, 537, 34,
+            126, 60, 130, 13, 408, 214, 562,
+        )),   # tr808
+        (256, (
+            857, 1070, 960, 967, 135, 221, 61, 531, 531, 397, 1060, 784,
+            257, 247, 1103, 948, 1081,
+        )),   # tr909
+        (273, (
+            134, 200, 244, 1235, 73, 462, 148, 206, 264, 192,
+        )),   # linn9000
+        (283, (
+            45, 427, 353, 193,
+        )),   # mr12
+        (287, (
+            40, 10, 68, 15, 13, 138, 28, 149, 65, 499, 206, 408, 647,
+            361, 164, 78, 430, 93, 70, 37, 15, 21, 15, 17,
+        )),   # synthetics
+        (311, (
+            663, 696, 897, 1078, 976, 1098, 988, 998, 926, 1010, 982,
+            1109, 1031, 1498, 2860, 1173, 1106, 845, 954, 782,
+        )),   # power
+        (331, (
+            278, 310, 180, 157, 204, 89, 182, 217, 56, 171, 176, 286, 97,
+            111, 136, 144, 128, 1827, 385, 275, 179, 170, 153, 908, 238,
+            430, 1167, 143, 156, 178, 219, 132, 256, 329, 329, 106, 207,
+            268, 1030, 2062, 184, 486, 219, 105,
+        )),   # percussion
+        (375, (
+            140, 116, 32,
+        )),   # acoustic
+        (378, (
+            2490, 1672, 2043, 1637, 2546, 1379, 1968, 4821, 1204, 1384,
+            575, 734, 5201, 1062,
+        )),   # extras
+):
+    for _i, _v in enumerate(_ms):
+        PCM_MS[_start + _i] = _v
+
+
+def sample_ms(preset):
+    """How many milliseconds this sample runs for (0 if unknown)."""
+    if preset == NO_SAMPLE:
+        return 0
+    return PCM_MS.get(preset, 0)
+
+
 def sample_name(preset):
     """Human name for a PCM preset, or 'OFF' for no sample."""
     if preset == NO_SAMPLE:
@@ -419,6 +486,13 @@ BPM_STEP = 1             # a single tap of +/- nudges by this
 BPM_STEP_FAST = 10       # holding +/- repeats at this rate instead
 VOL_STEP = 0.05
 MUTE_VEL = 0.001         # vel=0 is a note-off, so silence is a tiny vel
+
+# How close the gap between two hits has to be to the sample's own length
+# before we bother choking it (see Lane.choke_steps). AMY's retrigger bug
+# needs the two to essentially coincide; this is the safety margin around
+# that, wide enough to absorb tempo/pitch slop, narrow enough that a long
+# sample being retriggered mid-swing is never hard-cut (which clicks).
+CHOKE_WINDOW_MS = 50
 
 FILTER_NAMES = ["OFF", "LPF", "HPF"]
 BUS_FX_DEFAULTS = {
@@ -758,6 +832,12 @@ def configure_lane(lane):
                 print("sample load failed on osc", lane._osc, ex)
         # if NO_SAMPLE: nothing to configure - out_vel() gates the lane
         # silent below, exactly like a GM kit lacking that drum used to.
+        # A different sample is a different length, so whether this lane's
+        # hits need choking can change with it.
+        try:
+            lane.sync_choke_events()
+        except Exception:
+            pass
     apply_lane_route(lane)
 
 
@@ -1068,6 +1148,33 @@ def ticks_per_step():
         return 6
 
 
+def step_duration_ms():
+    """Wall-clock length of one 1/32 step at the current tempo. The bar is
+    NUM_STEPS steps of 4 quarter notes, so there are NUM_STEPS/4 steps to
+    the quarter."""
+    try:
+        bpm = app.bpm if app is not None else 120
+    except Exception:
+        bpm = 120
+    if not bpm or bpm <= 0:
+        bpm = 120
+    return (60000.0 / bpm) / (NUM_STEPS / 4.0)
+
+
+def resync_all_chokes():
+    """Re-evaluate every lane's pre-hit note-offs. Needed whenever
+    something the decision depends on changes that isn't a step edit -
+    the tempo, or a lane's sample."""
+    if app is None or app.seq is None:
+        return
+    with _seq_batch():
+        for r in app.rows:
+            try:
+                r.sync_choke_events()
+            except Exception:
+                pass
+
+
 # The drum hits are sequenced by AMY itself, not by a Python callback.
 #
 #   - app.seq = sequencer.AMYSequence(NUM_STEPS, NUM_STEPS): a 32-step
@@ -1241,6 +1348,15 @@ def _led_tick(x):
             return
         step = int(x / app.ticks_per_step) % NUM_STEPS
         app.current_step = step
+        # CV CLOCK FIRST. This is the one timing-sensitive thing left in
+        # this callback - the drums are AMY's now, and the LED is
+        # cosmetic, but a eurorack clock edge is heard as timing. Emitting
+        # it before any of the bookkeeping below means a queued bank
+        # switch (which loads a whole pattern) or a transport change can
+        # no longer push the clock edge late. It cannot remove the jitter
+        # the MicroPython scheduler itself adds in delivering this
+        # callback, but it removes all the jitter we were adding here.
+        _cv_tick(step)
         if step == 0 and app.pending_play is not None:
             _apply_transport(app.pending_play)
         # A bank switch calls apply_kit() -> configure_lane(), which
@@ -1264,8 +1380,8 @@ def _led_tick(x):
         # callback; it is now scheduled in AMY's own sequencer alongside
         # the hits (see the choke notes below), so nothing this callback
         # does - or fails to do on time - can affect the drums. What is
-        # left is the eurorack clock and the playhead LED.
-        _cv_tick(step)
+        # left is the eurorack clock (emitted first, above) and the
+        # playhead LED.
         if app.playing and not app.ui_paused:
             app.led_row.light(step)
     except Exception as ex:
@@ -1791,20 +1907,52 @@ class Lane(UIElement):
     # -- pre-hit choke, as AMY-sequenced events (see the choke notes) --
 
     def choke_steps(self):
-        """The steps at which this lane needs a note-off: the step BEFORE
-        each hit, but only where the lane isn't already playing on that
-        step (a hit that close never needs choking, and choking it would
-        cut a drum roll short).
+        """The steps at which this lane needs a pre-hit note-off.
 
-        This depends on the step pattern ONLY - not on mute/solo/volume -
-        so it never has to be recomputed when the mix changes. Note these
-        steps are by definition NOT hits, so hits + chokes can never
-        exceed NUM_STEPS per lane, keeping us inside AMY's event budget."""
+        The choke exists ONLY to dodge one narrow AMY bug: retriggering a
+        PCM oscillator just as its previous sample runs out makes
+        pcm_find_next_zero_crossing() return -1, which the render loop
+        reads as a huge loopend and the hit is swallowed. That needs the
+        gap between two hits to land on the sample's own length - which is
+        exactly why it first showed up on Tokyo Burst bd (a 499ms sample,
+        hits 8 steps apart at 120bpm = 500ms).
+
+        Choking anything else is actively harmful: a note-off hard-stops
+        PCM immediately (SYNTH_OFF, no release ramp), so cutting a long
+        sample mid-swing leaves an amplitude step - an audible CLICK. That
+        is what a 3.1s TR-808 kick did when choked 250ms in. Left alone,
+        AMY restarts a still-sounding sample at its next zero crossing,
+        which is click-free by design.
+
+        So a hit is choked only when the previous hit's sample would be
+        ending right about now, within CHOKE_WINDOW_MS. Skipped entirely
+        when the lane also plays on the step before (a roll that close is
+        nowhere near the sample end, and choking would cut it short).
+
+        Depends on the pattern, the lane's sample and the tempo - never on
+        mute/solo/volume. Choke steps are by definition NOT hit steps, so
+        hits + chokes still can't exceed NUM_STEPS per lane, keeping the
+        grid inside AMY's event budget."""
         ss = self.step_set
+        if not ss:
+            return set()
+        dur = sample_ms(self._preset)
+        if dur <= 0:
+            return set()                    # unknown sample: don't guess
+        step_ms = step_duration_ms()
+        ordered = sorted(ss)
+        n = len(ordered)
         out = set()
-        for s in ss:
+        for i in range(n):
+            s = ordered[i]
             p = (s - 1) % NUM_STEPS
-            if p not in ss:
+            if p in ss:
+                continue                    # roll - never choke
+            prev = ordered[i - 1]           # wraps to the last hit of the bar
+            gap_steps = (s - prev) % NUM_STEPS
+            if gap_steps == 0:
+                gap_steps = NUM_STEPS       # a lone hit repeats each bar
+            if abs(gap_steps * step_ms - dur) <= CHOKE_WINDOW_MS:
                 out.add(p)
         return out
 
@@ -3615,6 +3763,9 @@ def set_bpm(v):
         sequencer.tempo(app.bpm)
     except Exception:
         pass
+    # whether a hit needs choking depends on the gap in milliseconds, so
+    # the tempo changing can add or drop note-offs
+    resync_all_chokes()
     app.header.set_bpm(app.bpm)
 
 
