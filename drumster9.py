@@ -97,6 +97,11 @@ try:
 except ImportError:
     math = None
 
+try:
+    import array           # int16 view of AMY's output block, for the meter
+except ImportError:
+    array = None
+
 # Build marker. Printed by run(), and shown in the info line, so you can
 # confirm which copy of this file the Tulip is ACTUALLY executing.
 # MicroPython caches imported modules in sys.modules, so overwriting the
@@ -106,7 +111,7 @@ except ImportError:
 #     import sys; sys.modules.pop('drumster9', None)
 #     run('drumster9.py')
 # or just reboot the Tulip and run it again.
-APP_BUILD = "2026-09-23 mix-meter-spacing"
+APP_BUILD = "2026-09-23 live-output-meter"
 
 try:
     import ujson as json
@@ -546,10 +551,32 @@ BUS_VOLUME = 15.0        # per-bus mixdown level into the final output
 MAX_MASTER_VOL = 30.0    # top of the MIX page's master fader
 MASTER_VOL_STEP = 0.5    # what one tap of master -/+ moves
 
-# The MIX page's master meter, in dB relative to unity gain (AMY's bus
-# `volume` is a linear multiplier, so 1.0 = 0 dB). NOTE this shows the
-# level you have SET, not a measured signal - AMY gives Python no output
-# metering to read, so a true peak/RMS meter isn't available to us.
+# --- the MIX page's master meter --------------------------------------
+#
+# A REAL meter where the firmware allows it. amy.get_output_buffer() hands
+# back the most recent rendered audio block as raw bytes, so we can read
+# the peak AMY is actually putting out and show it in dBFS (0 dBFS = full
+# scale = clipping). On Tulip that call resolves to
+# tulip.amy_get_output_buffer; where a build lacks the binding amy.py
+# raises NotImplementedError, and we fall back to drawing the level you
+# have SET on a gain scale instead (see MixPage._live).
+#
+# Honest limitation even when live: we poll one block every METER_MS
+# rather than seeing every block, so this is a SAMPLED peak, not a true
+# peak - a transient landing between polls is missed. At ~20Hz against
+# drum hits that ring for 100ms+ it catches what you want to see, but it
+# is not a certified peak meter.
+METER_MS = 50            # poll the output block at ~20Hz while MIX is open
+METER_RELEASE_DB = 2.5   # dB the needle falls per tick (fast up, slow down)
+
+# live (measured) scale, dBFS
+METER_MIN_DBFS = -60.0
+METER_MAX_DBFS = 0.0
+METER_TICKS_DBFS = (0, -6, -12, -24, -36, -48, -60)
+METER_WARN_DBFS = -6.0   # amber above this
+METER_HOT_DBFS = -1.0    # red above this - essentially clipping
+
+# fallback (set-level) scale, dB relative to unity gain
 METER_MIN_DB = -30.0
 METER_MAX_DB = 30.0
 METER_TICKS_DB = (30, 20, 10, 0, -10, -20, -30)
@@ -1122,12 +1149,57 @@ def gain_to_db(v):
         return METER_MIN_DB
 
 
-def db_to_frac(db):
-    """Where a dB value sits on the meter, 0.0 (bottom) .. 1.0 (top)."""
-    span = METER_MAX_DB - METER_MIN_DB
+def db_to_frac(db, lo=None, hi=None):
+    """Where a dB value sits on a meter, 0.0 (bottom) .. 1.0 (top)."""
+    if lo is None:
+        lo = METER_MIN_DB
+    if hi is None:
+        hi = METER_MAX_DB
+    span = hi - lo
     if span <= 0:
         return 0.0
-    return clampf((db - METER_MIN_DB) / span, 0.0, 1.0)
+    return clampf((db - lo) / span, 0.0, 1.0)
+
+
+def output_meter_supported():
+    """Whether this firmware lets Python read AMY's rendered output. The
+    call itself is the probe: amy.py raises NotImplementedError when the
+    binding is missing. A None result just means no block is ready yet,
+    which still counts as supported."""
+    if math is None or array is None:
+        return False
+    try:
+        amy.get_output_buffer()
+        return True
+    except Exception:
+        return False
+
+
+def output_peak_dbfs():
+    """Peak level of AMY's most recent rendered audio block, in dBFS.
+    None if nothing could be read this time round."""
+    try:
+        buf = amy.get_output_buffer()
+    except Exception:
+        return None
+    if not buf:
+        return None
+    try:
+        # int16 view, so max()/min() scan in C rather than a Python loop
+        a = array.array('h', buf)
+        if len(a) == 0:
+            return None
+        hi = max(a)
+        lo = min(a)
+        pk = hi if hi >= -lo else -lo
+    except Exception:
+        return None
+    if pk <= 0:
+        return METER_MIN_DBFS
+    try:
+        return 20.0 * math.log10(pk / 32768.0)
+    except Exception:
+        return None
 
 
 def set_master_vol(v):
@@ -2962,10 +3034,18 @@ class MixPage:
         self.master_value.set_text("")
         self.master_value.align_to(self.panel, lv.ALIGN.LEFT_MID, 706, ym)
 
-        # --- master out meter, on a dB scale, down the right-hand side ---
+        # --- master out meter, down the right-hand side ---
+        # Live (measuring AMY's real output in dBFS) where the firmware
+        # exposes the output buffer, otherwise a static read-out of the
+        # level you have set. Probed once, here, because it decides which
+        # scale the ticks are drawn on.
+        self._live = output_meter_supported()
+        self._meter_running = False
+        self._meter_db = METER_MIN_DBFS if self._live else METER_MIN_DB
+
         cap = lv.label(self.panel)
-        cap.set_text("OUT")
-        cap.align_to(self.panel, lv.ALIGN.LEFT_MID, 812,
+        cap.set_text("OUT dBFS" if self._live else "OUT (set)")
+        cap.align_to(self.panel, lv.ALIGN.LEFT_MID, 806,
                       MixPage._METER_Y - MixPage._METER_H // 2 - 16)
 
         self.meter_track = lv.obj(self.panel)
@@ -2987,13 +3067,16 @@ class MixPage:
         self.meter_fill.remove_flag(lv.obj.FLAG.CLICKABLE)
         lv_depad(self.meter_fill)
 
-        # dB scale beside the meter
+        # dB scale beside the meter, on whichever scale is in use
         top = MixPage._METER_Y - MixPage._METER_H / 2.0
-        for d in METER_TICKS_DB:
+        ticks = METER_TICKS_DBFS if self._live else METER_TICKS_DB
+        lo, hi = self._scale()
+        for d in ticks:
             t = lv.label(self.panel)
-            t.set_text("%+d" % d if d else "  0")
+            t.set_text("%d" % d if d <= 0 else "+%d" % d)
             t.align_to(self.panel, lv.ALIGN.LEFT_MID, 866,
-                        int(top + (1.0 - db_to_frac(d)) * MixPage._METER_H))
+                        int(top + (1.0 - db_to_frac(d, lo, hi))
+                             * MixPage._METER_H))
 
         self.meter_db = lv.label(self.panel)
         self.meter_db.set_text("")
@@ -3057,23 +3140,76 @@ class MixPage:
             pass
         self._refresh_meter()
 
-    def _refresh_meter(self):
-        """Grow the meter fill from the bottom to the current master level
-        on the dB scale, and print the figure underneath."""
+    def _scale(self):
+        if self._live:
+            return METER_MIN_DBFS, METER_MAX_DBFS
+        return METER_MIN_DB, METER_MAX_DB
+
+    def _draw_meter(self, db):
+        """Grow the fill from the bottom to `db` on the current scale, and
+        print the figure underneath."""
         try:
-            db = gain_to_db(master_vol())
-            h = int(db_to_frac(db) * (MixPage._METER_H - 8))
+            lo, hi = self._scale()
+            h = int(db_to_frac(db, lo, hi) * (MixPage._METER_H - 8))
             if h < 2:
                 h = 2                      # keep a visible sliver at silence
             self.meter_fill.set_size(MixPage._METER_W - 8, h)
             self.meter_fill.align_to(self.meter_track,
                                       lv.ALIGN.BOTTOM_MID, 0, -4)
-            if db <= METER_MIN_DB:
+            if self._live:
+                # green, amber approaching full scale, red at clipping
+                if db >= METER_HOT_DBFS:
+                    c = C_MUTE_ON
+                elif db >= METER_WARN_DBFS:
+                    c = C_PENDING
+                else:
+                    c = C_CELL_ON
+                self.meter_fill.set_style_bg_color(lv_color(c), 0)
+            if db <= lo:
                 self.meter_db.set_text("-inf")
             else:
-                self.meter_db.set_text("%+.1f dB" % db)
+                self.meter_db.set_text("%.1f" % db if self._live
+                                        else "%+.1f dB" % db)
         except Exception:
             pass
+
+    def _refresh_meter(self):
+        """Static refresh. When live, the polling loop owns the needle and
+        this only has to keep the fallback read-out honest."""
+        if self._live:
+            return
+        self._draw_meter(gain_to_db(master_vol()))
+
+    # -- live metering: poll AMY's rendered output while the page is open --
+
+    def _meter_start(self):
+        if not self._live or self._meter_running:
+            return
+        self._meter_running = True
+        self._meter_db = METER_MIN_DBFS
+        self._draw_meter(self._meter_db)     # start from the floor
+        # defer_try, not defer_safe: this callback re-arms itself, and
+        # defer_safe's "run it inline instead" fallback would recurse.
+        if not defer_try(self._meter_tick, None, METER_MS):
+            self._meter_running = False
+
+    def _meter_stop(self):
+        self._meter_running = False
+
+    def _meter_tick(self, arg=None):
+        if not self._meter_running:
+            return
+        db = output_peak_dbfs()
+        if db is not None:
+            # fast attack, slow release, like a real meter's ballistics
+            if db > self._meter_db:
+                self._meter_db = db
+            else:
+                self._meter_db = max(db, self._meter_db - METER_RELEASE_DB)
+            self._draw_meter(self._meter_db)
+        if self._meter_running:
+            if not defer_try(self._meter_tick, None, METER_MS):
+                self._meter_running = False
 
     def refresh(self):
         for i in range(len(self.rows)):
@@ -3093,11 +3229,13 @@ class MixPage:
             lv.screen_load(self.screen)
         except Exception as ex:
             print("mix show failed:", ex)
+        self._meter_start()     # only polls while the page is actually up
 
     def close(self, e=None):
         self.hide()
 
     def hide(self):
+        self._meter_stop()
         try:
             lv.screen_load(app.screen)
         except Exception as ex:
