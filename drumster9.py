@@ -111,7 +111,7 @@ except ImportError:
 #     import sys; sys.modules.pop('drumster9', None)
 #     run('drumster9.py')
 # or just reboot the Tulip and run it again.
-APP_BUILD = "2026-09-23 meter-peak-hold"
+APP_BUILD = "2026-09-23 meter-ballistics"
 
 try:
     import ujson as json
@@ -577,10 +577,19 @@ MASTER_VOL_STEP = 0.5    # what one tap of master -/+ moves
 #
 # Still not a true peak meter: between two polls a block can pass unseen.
 METER_MS = 5             # i.e. "as soon as the defer clock allows"
-METER_HOLD_MS = 600      # how long a caught peak stays up before falling
-METER_RELEASE_DB_S = 40.0  # fall rate in dB per SECOND once the hold expires
+
+# BALLISTICS. These decide how alive the meter looks, and the hold is the
+# one that bites: hold it longer than the gap between hits and every new
+# hit re-arms it before it has started to fall, so the needle pins at the
+# peak and the meter looks frozen. At 120bpm hits land 125-250ms apart,
+# so the hold has to be a good deal shorter than that - just long enough
+# that a caught transient is on screen for a few frames. The release then
+# has to drop enough in the gap to be visibly moving: 60 dB/s falls ~8 dB
+# between kicks, which reads as a clear bounce.
+METER_HOLD_MS = 120      # how long a caught peak stays up before falling
+METER_RELEASE_DB_S = 60.0  # fall rate in dB per SECOND once the hold expires
 METER_RELEASE_DB = 2.5   # per-poll fallback if no millisecond clock exists
-METER_REDRAW_DB = 0.5    # don't repaint LVGL for changes smaller than this
+METER_REDRAW_DB = 0.4    # don't repaint LVGL for changes smaller than this
 
 # live (measured) scale, dBFS
 METER_MIN_DBFS = -60.0
