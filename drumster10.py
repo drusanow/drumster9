@@ -92,6 +92,11 @@ import amy
 import sequencer
 import random
 
+try:
+    import math            # only for the MIX page's dB meter
+except ImportError:
+    math = None
+
 # Build marker. Printed by run(), and shown in the info line, so you can
 # confirm which copy of this file the Tulip is ACTUALLY executing.
 # MicroPython caches imported modules in sys.modules, so overwriting the
@@ -101,7 +106,7 @@ import random
 #     import sys; sys.modules.pop('drumster10', None)
 #     run('drumster10.py')
 # or just reboot the Tulip and run it again.
-APP_BUILD = "2026-09-23 mix-page-ui"
+APP_BUILD = "2026-09-23 mix-meter-spacing"
 
 try:
     import ujson as json
@@ -541,6 +546,14 @@ BUS_VOLUME = 15.0        # per-bus mixdown level into the final output
 MAX_MASTER_VOL = 30.0    # top of the MIX page's master fader
 MASTER_VOL_STEP = 0.5    # what one tap of master -/+ moves
 
+# The MIX page's master meter, in dB relative to unity gain (AMY's bus
+# `volume` is a linear multiplier, so 1.0 = 0 dB). NOTE this shows the
+# level you have SET, not a measured signal - AMY gives Python no output
+# metering to read, so a true peak/RMS meter isn't available to us.
+METER_MIN_DB = -30.0
+METER_MAX_DB = 30.0
+METER_TICKS_DB = (30, 20, 10, 0, -10, -20, -30)
+
 
 # --- layout (1024 x 600) ----------------------------------------------
 
@@ -569,12 +582,19 @@ X_KIT = 164
 X_STEPS = 224
 ROW_W = X_STEPS + NUM_STEPS * STEP_W + 8
 
-# Worked back from the screen bottom:
-#   20 + 2*60 + 22(LED) + 8 + 7*50 + 12 + 56 = 578 of 600
-SCREEN_TOP = 20
-GAP_HEADER_TO_LED = 4
-GAP_LED_TO_GRID = 8
-GAP_GRID_TO_BUS = 12
+# Worked back from the screen bottom. The whole stack is:
+#   SCREEN_TOP + 2*HDR_H + GAP_HEADER_TO_LED + LED_ROW_H
+#   + GAP_LED_TO_GRID + 7*ROW_H + GAP_GRID_TO_BUS + BUS_ROW_H
+#   = 18 + 120 + 2 + 22 + 6 + 350 + 8 + 56 = 582 of 600
+# which leaves 18px under the bank strip. It used to leave only 8, so the
+# COPY/PASTE/CV row sat right on the bottom edge and was awkward to hit -
+# these gaps were each trimmed a little to lift the whole stack, rather
+# than shrinking any button. GAP_GRID_TO_BUS stays big enough that the
+# bank strip never touches the bottom of the sequencer grid.
+SCREEN_TOP = 18
+GAP_HEADER_TO_LED = 2
+GAP_LED_TO_GRID = 6
+GAP_GRID_TO_BUS = 8
 
 
 def rgb332(r, g, b):
@@ -767,6 +787,13 @@ class Button:
     def set_text(self, t):
         try:
             self.label.set_text(t)
+            # Re-centre. align_to() bakes in an offset computed from the
+            # label's width AT THE TIME IT IS CALLED, so a label created
+            # narrow ("-") and later set wide ("Perc") keeps the old
+            # offset and drifts right, running off the button. Every
+            # button whose text changes hit this - the per-lane kit
+            # buttons worst, since they go from 1 character to 4.
+            self.label.align_to(self.obj, lv.ALIGN.CENTER, 0, 0)
         except Exception:
             pass
 
@@ -1082,6 +1109,25 @@ def master_vol():
     if v is None:
         return BUS_VOLUME
     return v
+
+
+def gain_to_db(v):
+    """A linear gain as dB relative to unity (1.0 -> 0 dB). Silence and
+    anything unrepresentable floor at the bottom of the meter."""
+    if not v or v <= 0 or math is None:
+        return METER_MIN_DB
+    try:
+        return 20.0 * math.log10(v)
+    except Exception:
+        return METER_MIN_DB
+
+
+def db_to_frac(db):
+    """Where a dB value sits on the meter, 0.0 (bottom) .. 1.0 (top)."""
+    span = METER_MAX_DB - METER_MIN_DB
+    if span <= 0:
+        return 0.0
+    return clampf((db - METER_MIN_DB) / span, 0.0, 1.0)
 
 
 def set_master_vol(v):
@@ -2830,9 +2876,22 @@ def open_kits(e=None):
 # message per bus - no sequence work, so you can ride a fader while the
 # pattern plays.
 
+def _green_knob(sl):
+    """Give a slider a green rounded tip. The knob is its own LVGL part,
+    so the fill and track keep the default look."""
+    try:
+        sl.set_style_bg_color(lv_color(C_CELL_ON), lv.PART.KNOB)
+        sl.set_style_radius(9, lv.PART.KNOB)
+    except Exception:
+        pass        # older binding without PART.KNOB - cosmetic only
+
+
 class MixPage:
     _Y_FIRST = -150
     _Y_STEP = 44
+    _METER_W = 44
+    _METER_H = 330
+    _METER_Y = 8            # meter centre, relative to the panel centre
 
     def __init__(self, parent):
         self.screen = lv.obj()
@@ -2863,24 +2922,27 @@ class MixPage:
         title.align_to(self.panel, lv.ALIGN.LEFT_MID, 20, -205)
         Button(self.panel, "Close", 880, 90, 44, self.close, C_BTN, -205)
 
-        # one row per lane: name, -, fader, +, percent
+        # one row per lane: name, -, fader, +, percent. The faders are
+        # narrower than the full panel to leave the right-hand column for
+        # the master meter.
         self.rows = []
         for i, (role, _note, _vol) in enumerate(ELEMENTS):
             y = MixPage._Y_FIRST + i * MixPage._Y_STEP
             lab = lv.label(self.panel)
             lab.set_text(role)
             lab.align_to(self.panel, lv.ALIGN.LEFT_MID, 24, y)
-            Button(self.panel, "-", 120, 46, 36, self._make_step(i, -1),
+            Button(self.panel, "-", 110, 44, 36, self._make_step(i, -1),
                     C_BTN, y)
             sl = lv.slider(self.panel)
-            sl.set_size(560, 18)
-            sl.align_to(self.panel, lv.ALIGN.LEFT_MID, 180, y)
+            sl.set_size(470, 18)
+            sl.align_to(self.panel, lv.ALIGN.LEFT_MID, 168, y)
             sl.add_event_cb(self._make_slide(i), lv.EVENT.VALUE_CHANGED, None)
-            Button(self.panel, "+", 754, 46, 36, self._make_step(i, 1),
+            _green_knob(sl)
+            Button(self.panel, "+", 652, 44, 36, self._make_step(i, 1),
                     C_BTN, y)
             val = lv.label(self.panel)
             val.set_text("")
-            val.align_to(self.panel, lv.ALIGN.LEFT_MID, 812, y)
+            val.align_to(self.panel, lv.ALIGN.LEFT_MID, 706, y)
             self.rows.append((sl, val))
 
         # master out
@@ -2888,16 +2950,55 @@ class MixPage:
         mlab = lv.label(self.panel)
         mlab.set_text("MASTER")
         mlab.align_to(self.panel, lv.ALIGN.LEFT_MID, 24, ym)
-        Button(self.panel, "-", 120, 46, 36, self.master_down, C_KIT_ON, ym)
+        Button(self.panel, "-", 110, 44, 36, self.master_down, C_KIT_ON, ym)
         self.master_slider = lv.slider(self.panel)
-        self.master_slider.set_size(560, 18)
-        self.master_slider.align_to(self.panel, lv.ALIGN.LEFT_MID, 180, ym)
+        self.master_slider.set_size(470, 18)
+        self.master_slider.align_to(self.panel, lv.ALIGN.LEFT_MID, 168, ym)
         self.master_slider.add_event_cb(self._master_slide,
                                          lv.EVENT.VALUE_CHANGED, None)
-        Button(self.panel, "+", 754, 46, 36, self.master_up, C_KIT_ON, ym)
+        _green_knob(self.master_slider)
+        Button(self.panel, "+", 652, 44, 36, self.master_up, C_KIT_ON, ym)
         self.master_value = lv.label(self.panel)
         self.master_value.set_text("")
-        self.master_value.align_to(self.panel, lv.ALIGN.LEFT_MID, 812, ym)
+        self.master_value.align_to(self.panel, lv.ALIGN.LEFT_MID, 706, ym)
+
+        # --- master out meter, on a dB scale, down the right-hand side ---
+        cap = lv.label(self.panel)
+        cap.set_text("OUT")
+        cap.align_to(self.panel, lv.ALIGN.LEFT_MID, 812,
+                      MixPage._METER_Y - MixPage._METER_H // 2 - 16)
+
+        self.meter_track = lv.obj(self.panel)
+        self.meter_track.set_size(MixPage._METER_W, MixPage._METER_H)
+        self.meter_track.set_style_bg_color(lv_color(C_BANK_EMPTY), 0)
+        self.meter_track.set_style_radius(4, 0)
+        self.meter_track.align_to(self.panel, lv.ALIGN.LEFT_MID, 806,
+                                   MixPage._METER_Y)
+        self.meter_track.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        self.meter_track.remove_flag(lv.obj.FLAG.CLICKABLE)
+        lv_depad(self.meter_track)
+
+        self.meter_fill = lv.obj(self.meter_track)
+        self.meter_fill.set_size(MixPage._METER_W - 8, 2)
+        self.meter_fill.set_style_bg_color(lv_color(C_CELL_ON), 0)
+        self.meter_fill.set_style_radius(3, 0)
+        self.meter_fill.set_style_border_width(0, 0)
+        self.meter_fill.remove_flag(lv.obj.FLAG.SCROLLABLE)
+        self.meter_fill.remove_flag(lv.obj.FLAG.CLICKABLE)
+        lv_depad(self.meter_fill)
+
+        # dB scale beside the meter
+        top = MixPage._METER_Y - MixPage._METER_H / 2.0
+        for d in METER_TICKS_DB:
+            t = lv.label(self.panel)
+            t.set_text("%+d" % d if d else "  0")
+            t.align_to(self.panel, lv.ALIGN.LEFT_MID, 866,
+                        int(top + (1.0 - db_to_frac(d)) * MixPage._METER_H))
+
+        self.meter_db = lv.label(self.panel)
+        self.meter_db.set_text("")
+        self.meter_db.align_to(self.panel, lv.ALIGN.LEFT_MID, 806,
+                                MixPage._METER_Y + MixPage._METER_H // 2 + 16)
 
     # -- lane faders --
     def _make_slide(self, i):
@@ -2952,6 +3053,25 @@ class MixPage:
             if move_slider:
                 pct = int(v / MAX_MASTER_VOL * 100 + 0.5)
                 self.master_slider.set_value(clampf(pct, 0, 100), 0)
+        except Exception:
+            pass
+        self._refresh_meter()
+
+    def _refresh_meter(self):
+        """Grow the meter fill from the bottom to the current master level
+        on the dB scale, and print the figure underneath."""
+        try:
+            db = gain_to_db(master_vol())
+            h = int(db_to_frac(db) * (MixPage._METER_H - 8))
+            if h < 2:
+                h = 2                      # keep a visible sliver at silence
+            self.meter_fill.set_size(MixPage._METER_W - 8, h)
+            self.meter_fill.align_to(self.meter_track,
+                                      lv.ALIGN.BOTTOM_MID, 0, -4)
+            if db <= METER_MIN_DB:
+                self.meter_db.set_text("-inf")
+            else:
+                self.meter_db.set_text("%+.1f dB" % db)
         except Exception:
             pass
 
