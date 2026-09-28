@@ -111,7 +111,7 @@ except ImportError:
 #     import sys; sys.modules.pop('drumster9', None)
 #     run('drumster9.py')
 # or just reboot the Tulip and run it again.
-APP_BUILD = "2026-09-23 meter-ballistics"
+APP_BUILD = "2026-09-28 cv-grid-clock"
 
 try:
     import ujson as json
@@ -4387,10 +4387,13 @@ CV_RUN_CH = 1            # VOUT1
 CV_DIV = 2               # one clock pulse every N of the 32 steps:
 #                          1 = 1/32, 2 = 1/16, 4 = 1/8, 8 = 1/4 note.
 #                          2 (a 16th-note clock) suits most eurorack gear.
-CV_PULSE_MS = 10         # clock/reset pulse width. Tulip's defer fires on
-#                          AMY sequencer ticks (~10ms at 120bpm), so the
-#                          real pulse is 10-20ms - plenty for eurorack,
-#                          and short enough not to swallow a 1/32 step.
+CV_PULSE_MS = 10         # ONLY used at CV_DIV = 1. Every other division is
+#                          a 50% square wave with both edges on the step
+#                          grid (see _cv_tick), which is steadier. A 1/32
+#                          clock has no half-step to fall on, so it still
+#                          needs a timed pulse: Tulip's defer fires on AMY
+#                          sequencer ticks (~10ms at 120bpm), so that pulse
+#                          is really 10-20ms wide.
 CV_VOUT1 = "off"         # "off"   - VOUT1 parked at 0V and never touched
 #                                    again (clock on VOUT0 only)
 #                          "run"   - high the whole time the transport runs
@@ -4450,6 +4453,7 @@ _cv = None               # the DAC handle once we've proven it responds
 _cv_fails = 0
 _cv_ready = False        # False until the soft-start ramp has finished
 _cv_tokens = {}          # channel -> id of the pulse that owns it
+_cv_level = {}           # channel -> last level written OK (True = high)
 
 
 class _MabeeDac:
@@ -4459,6 +4463,11 @@ class _MabeeDac:
     def __init__(self):
         from machine import I2C
         self.bus = I2C(0, freq=CV_I2C_FREQ)
+        # volts -> ready-made 2-byte register payload. The clock only ever
+        # writes CV_HIGH_V and CV_LOW_V, so after the first edge of each
+        # the hot path does no float maths and allocates nothing - no
+        # garbage building up to trigger a GC pause mid-clock.
+        self._payload = {}
         if CV_SET_RANGE_10V:
             # only when asked - an unnecessary config write to a chip
             # that is already right is a risk with no upside
@@ -4466,14 +4475,18 @@ class _MabeeDac:
                                   bytes([CV_RANGE_10V]))
 
     def set(self, volts, channel=0):
-        v = int((volts / 10.0) * 65535.0)
-        if v > 65535:
-            v = 65535
-        if v < 0:
-            v = 0
+        p = self._payload.get(volts)
+        if p is None:
+            v = int((volts / 10.0) * 65535.0)
+            if v > 65535:
+                v = 65535
+            if v < 0:
+                v = 0
+            p = bytes([v & 0xff, (v >> 8) & 0xff])
+            self._payload[volts] = p
         addr = CV_ADDR if channel < 2 else 88
         reg = 0x02 if (channel % 2) == 0 else 0x04
-        self.bus.writeto_mem(addr, reg, bytes([v & 0xff, (v >> 8) & 0xff]))
+        self.bus.writeto_mem(addr, reg, p)
 
 
 def cv_init():
@@ -4499,6 +4512,7 @@ def cv_init():
         print("[cv] no DAC responding on the I2C port:", repr(ex))
         return False
     _cv = dac
+    _cv_forget_levels()      # we just parked both outputs by hand
     print("[cv] Mabee DAC ready - clock on VOUT0, VOUT1 %s" % CV_VOUT1)
     _cv_ramp_start()
     return True
@@ -4510,6 +4524,7 @@ def _cv_ramp_start():
     _cv_ready = False
     if CV_RAMP_STEPS <= 0:
         _cv_write(CV_LOW_V, CV_CLOCK_CH)
+        _cv_forget_levels()
         _cv_ready = True
         return
     _cv_ramp_step(0)
@@ -4526,6 +4541,7 @@ def _cv_ramp_step(i=0):
         i = 0
     if i > 2 * n:
         _cv_write(CV_LOW_V, CV_CLOCK_CH)
+        _cv_forget_levels()  # the ramp drove VOUT0 directly
         _cv_ready = True
         print("[cv] soft start done - clock running")
         return
@@ -4545,10 +4561,11 @@ def _cv_write(volts, ch):
     step for the rest of the session."""
     global _cv, _cv_fails
     if _cv is None:
-        return
+        return False
     try:
         _cv.set(volts, channel=ch)
         _cv_fails = 0
+        return True
     except Exception as ex:
         _cv_fails += 1
         if _cv_fails >= CV_MAX_FAILS:
@@ -4558,6 +4575,25 @@ def _cv_write(volts, ch):
                 app.header2.set_info("CV lost - check the DAC")
             if app is not None and app.bank_row is not None:
                 app.bank_row.refresh_cv()
+        return False
+
+
+def _cv_set_level(ch, high):
+    """Drive `ch` to its clock high or low level, but only if it isn't
+    there already. The level we last wrote SUCCESSFULLY is remembered, so
+    a write that failed is retried on the next step instead of being
+    mistaken for done."""
+    if _cv_level.get(ch) == high:
+        return
+    if _cv_write(CV_HIGH_V if high else CV_LOW_V, ch):
+        _cv_level[ch] = high
+
+
+def _cv_forget_levels():
+    """Forget what we think the outputs are showing, so the next edge is
+    always written. Needed whenever something writes the DAC directly
+    (bringup, the soft-start ramp, transport stop)."""
+    _cv_level.clear()
 
 
 def _cv_pulse(ch):
@@ -4577,13 +4613,33 @@ def _cv_pulse(ch):
 
 
 def _cv_tick(step):
-    """Called from _led_tick, once per 1/32 step, on the AMY clock."""
+    """Called first thing in _led_tick, once per 1/32 step, on AMY's clock.
+
+    The clock is a SQUARE WAVE LOCKED TO THE STEP GRID: high for the first
+    half of each clock period, low for the second. Both edges come from
+    this one callback, so there is no second, separately-scheduled event
+    to drift. The old approach raised the gate here and deferred its fall
+    to a timer - that fall landed 10-20ms later depending on where the
+    defer clock happened to be, and if the defer table was full it ran
+    inline, giving a near-zero-width pulse a module could miss outright.
+
+    It is also self-correcting. Each call works out what the level SHOULD
+    be for this step and writes only if it differs, so a late or dropped
+    callback is repaired by the next one rather than leaving the gate
+    stuck high. And because `step` comes from AMY's tick count, never from
+    counting our own calls, lateness can't accumulate into drift - the
+    edges stay phase-locked to the drums."""
     if _cv is None or not _cv_ready or not app.playing:
         return
-    if step % CV_DIV == 0:
+    if CV_DIV >= 2:
+        _cv_set_level(CV_CLOCK_CH, (step % CV_DIV) < (CV_DIV // 2))
+    elif step % CV_DIV == 0:
+        # 1/32 clock: there is no half-step on the grid to fall on, so
+        # this one division still needs the timed pulse
         _cv_pulse(CV_CLOCK_CH)
-    if CV_VOUT1 == "reset" and step == 0:
-        _cv_pulse(CV_RUN_CH)
+    if CV_VOUT1 == "reset":
+        # one-step reset pulse at the top of each bar, same method
+        _cv_set_level(CV_RUN_CH, step == 0)
 
 
 def cv_transport(playing):
@@ -4591,16 +4647,20 @@ def cv_transport(playing):
     with the drum machine."""
     if _cv is None:
         return
+    # the transport is a discontinuity - start the next edge from a clean
+    # slate so it is always written, whatever we last thought was out there
+    _cv_forget_levels()
     if playing:
         if CV_VOUT1 == "run":
-            _cv_write(CV_HIGH_V, CV_RUN_CH)
+            _cv_set_level(CV_RUN_CH, True)
     else:
-        # drop everything low so nothing downstream is left gated on
+        # drop everything low so nothing downstream is left gated on, and
+        # invalidate any 1/32-division pulse still waiting to fall
         _cv_tokens[CV_CLOCK_CH] = _cv_tokens.get(CV_CLOCK_CH, 0) + 1
         _cv_tokens[CV_RUN_CH] = _cv_tokens.get(CV_RUN_CH, 0) + 1
-        _cv_write(CV_LOW_V, CV_CLOCK_CH)
+        _cv_set_level(CV_CLOCK_CH, False)
         if CV_VOUT1 != "off":
-            _cv_write(CV_LOW_V, CV_RUN_CH)
+            _cv_set_level(CV_RUN_CH, False)
 
 
 def cv_all_low():
