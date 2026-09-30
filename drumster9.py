@@ -111,7 +111,7 @@ except ImportError:
 #     import sys; sys.modules.pop('drumster9', None)
 #     run('drumster9.py')
 # or just reboot the Tulip and run it again.
-APP_BUILD = "2026-09-28 cv-grid-clock"
+APP_BUILD = "2026-09-30 cv-reset-vout1"
 
 try:
     import ujson as json
@@ -1562,9 +1562,17 @@ def _led_tick(x):
         # no longer push the clock edge late. It cannot remove the jitter
         # the MicroPython scheduler itself adds in delivering this
         # callback, but it removes all the jitter we were adding here.
-        _cv_tick(step)
+        #
+        # The one exception is a transport change landing on this
+        # downbeat, which is applied just BEFORE the clock. Starting: so
+        # this very downbeat carries the first clock edge and the first
+        # reset pulse, and the rack starts in step with the drums rather
+        # than a clock late and a bar late on reset. Stopping: so no stray
+        # edge goes out on the beat we stop on. It only happens on the
+        # one downbeat where you press PLAY or STOP.
         if step == 0 and app.pending_play is not None:
             _apply_transport(app.pending_play)
+        _cv_tick(step)
         # A bank switch calls apply_kit() -> configure_lane(), which
         # would point the oscillators straight back at mmapped presets
         # while the cache is off. Hold it for the next bar; a save is
@@ -4394,10 +4402,13 @@ CV_PULSE_MS = 10         # ONLY used at CV_DIV = 1. Every other division is
 #                          needs a timed pulse: Tulip's defer fires on AMY
 #                          sequencer ticks (~10ms at 120bpm), so that pulse
 #                          is really 10-20ms wide.
-CV_VOUT1 = "off"         # "off"   - VOUT1 parked at 0V and never touched
-#                                    again (clock on VOUT0 only)
+CV_VOUT1 = "reset"       # "reset" - one-step pulse at the top of every bar,
+#                                    so downstream sequencers are pulled
+#                                    back into line each bar even if a
+#                                    clock edge was missed or late
 #                          "run"   - high the whole time the transport runs
-#                          "reset" - short pulse at the top of every bar
+#                          "off"   - VOUT1 parked at 0V and never touched
+#                                    again (clock on VOUT0 only)
 CV_MAX_FAILS = 5         # consecutive I2C errors before giving up
 
 # SOFT START. The first clock pulse after power-up is a 0V -> 5V step,
